@@ -374,6 +374,33 @@ function migrateTodayLogPayload(raw) {
   return { hypertrophy: { ...raw }, strength: {} }
 }
 
+const DEFAULT_COACH_CONTEXT = { running: 'normal', sleepHours: '', sleepFeel: 'ok', deload: false, race: false }
+
+function normalizeCoachContext(raw) {
+  if (!raw || typeof raw !== 'object') return { ...DEFAULT_COACH_CONTEXT }
+  return {
+    running: ['low', 'normal', 'high'].includes(raw.running) ? raw.running : 'normal',
+    sleepHours: raw.sleepHours != null && String(raw.sleepHours).trim() !== '' ? String(raw.sleepHours).trim() : '',
+    sleepFeel: ['great', 'good', 'ok', 'poor', 'bad'].includes(raw.sleepFeel) ? raw.sleepFeel : 'ok',
+    deload: Boolean(raw.deload),
+    race: Boolean(raw.race)
+  }
+}
+
+/** Postgres/PostgREST: coach_context column not migrated yet */
+function coachContextColumnError(err) {
+  if (!err) return false
+  const s = `${err.message || ''} ${err.details || ''} ${String(err.code || '')}`.toLowerCase()
+  if (!s.includes('coach_context')) return false
+  return s.includes('column') || s.includes('schema') || s.includes('42703') || s.includes('pgrst204') || s.includes('does not exist')
+}
+
+function omitCoachPayloadRow(row) {
+  if (!row || typeof row !== 'object') return row
+  const { coach_context: _omit, ...rest } = row
+  return rest
+}
+
 // ─── APP ───
 
 export default function App() {
@@ -391,8 +418,8 @@ export default function App() {
   const [lastUserPrompt, setLastUserPrompt] = useState('')
   const [lastCoachMsg, setLastCoachMsg] = useState('')
   const [followUp, setFollowUp] = useState('')
-  const [coachContext, setCoachContext] = useState({ running: 'normal', sleep: 'ok', deload: false, race: false })
-  const [circuitCoachId, setCircuitCoachId] = useState(null)
+  const [insightScope, setInsightScope] = useState('session')
+  const [coachContext, setCoachContext] = useState(() => ({ ...DEFAULT_COACH_CONTEXT }))
   const [planLoading, setPlanLoading] = useState(false)
   const [planError, setPlanError] = useState('')
   const [planData, setPlanData] = useState(null)
@@ -425,7 +452,13 @@ export default function App() {
     if (online && pendingSave.current && supabase) {
       const data = pendingSave.current
       pendingSave.current = null
-      supabase.from('today_log').upsert(data, { onConflict: 'user_id,log_date' }).catch(() => {})
+      ;(async () => {
+        let res = await supabase.from('today_log').upsert(data, { onConflict: 'user_id,log_date' })
+        if (res.error && coachContextColumnError(res.error)) {
+          res = await supabase.from('today_log').upsert(omitCoachPayloadRow(data), { onConflict: 'user_id,log_date' })
+        }
+        if (res.error) pendingSave.current = data
+      })().catch(() => { pendingSave.current = data })
     }
   }, [online])
 
@@ -454,12 +487,22 @@ export default function App() {
     if (!supabase) { setLoaded(true); return }
     ;(async () => {
       try {
-        const [prRes, histRes, todayRes] = await Promise.all([
+        const [prRes, histRes] = await Promise.all([
           supabase.from('personal_records').select('exercise_id, weight, recorded_date').eq('user_id', USER_ID),
-          supabase.from('workout_sessions').select('*').eq('user_id', USER_ID).order('session_date', { ascending: false }).limit(HISTORY_LIMIT),
-          supabase.from('today_log').select('sets_data, metcon_sel').eq('user_id', USER_ID).eq('log_date', today()).maybeSingle()
+          supabase.from('workout_sessions').select('*').eq('user_id', USER_ID).order('session_date', { ascending: false }).limit(HISTORY_LIMIT)
         ])
-        if (histRes.data?.length) {
+
+        if (histRes.error) {
+          console.error('workout_sessions load error:', histRes.error)
+          setHistory([])
+          if (prRes.data?.length) {
+            const p = {}
+            prRes.data.forEach(r => { p[r.exercise_id] = { weight: Number(r.weight), date: r.recorded_date } })
+            setPrs(p)
+          } else {
+            setPrs({})
+          }
+        } else if (histRes.data?.length) {
           setHistory(histRes.data)
           setPrs(recalculatePrsFromSessions(histRes.data))
         } else {
@@ -472,9 +515,19 @@ export default function App() {
             setPrs({})
           }
         }
+
+        let todayRes = await supabase.from('today_log').select('sets_data, metcon_sel, coach_context').eq('user_id', USER_ID).eq('log_date', today()).maybeSingle()
+        if (todayRes.error && coachContextColumnError(todayRes.error)) {
+          console.warn('today_log: coach_context column missing — run supabase/migrations/002_coach_context.sql')
+          todayRes = await supabase.from('today_log').select('sets_data, metcon_sel').eq('user_id', USER_ID).eq('log_date', today()).maybeSingle()
+        } else if (todayRes.error) {
+          console.error('today_log load error:', todayRes.error)
+        }
+
         if (todayRes.data) {
           if (todayRes.data.sets_data) setSetsByPhase(migrateTodayLogPayload(todayRes.data.sets_data))
           if (todayRes.data.metcon_sel) setMetconByPhase(migrateTodayLogPayload(todayRes.data.metcon_sel))
+          if (todayRes.data.coach_context) setCoachContext(normalizeCoachContext(todayRes.data.coach_context))
         }
       } catch (e) {
         console.error('Load error:', e)
@@ -493,18 +546,27 @@ export default function App() {
         log_date: today(),
         sets_data: setsByPhase,
         metcon_sel: metconByPhase,
+        coach_context: normalizeCoachContext(coachContext),
         updated_at: new Date().toISOString()
       }
       try {
-        await supabase.from('today_log').upsert(payload, { onConflict: 'user_id,log_date' })
-        pendingSave.current = null
+        let res = await supabase.from('today_log').upsert(payload, { onConflict: 'user_id,log_date' })
+        if (res.error && coachContextColumnError(res.error)) {
+          res = await supabase.from('today_log').upsert(omitCoachPayloadRow(payload), { onConflict: 'user_id,log_date' })
+        }
+        if (res.error) {
+          pendingSave.current = payload
+          console.error('Auto-save error:', res.error)
+        } else {
+          pendingSave.current = null
+        }
       } catch (e) {
         pendingSave.current = payload
         console.error('Auto-save error:', e)
       }
     }, 2000)
     return () => { if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current) }
-  }, [setsByPhase, metconByPhase, loaded])
+  }, [setsByPhase, metconByPhase, coachContext, loaded])
 
   // ─── Scroll to top on tab/day change ───
   useEffect(() => {
@@ -554,27 +616,44 @@ export default function App() {
     if (!supabase) { setSaveMsg('ERR: DB not configured'); setTimeout(() => setSaveMsg(''), 3000); return }
     setSaveMsg('SAVING...')
     try {
-      await supabase.from('workout_sessions').upsert({
+      const ctx = normalizeCoachContext(coachContext)
+      const sessionRow = {
         user_id: USER_ID,
         session_date: today(),
         day_idx: activeDay,
         day_name: dayData.name,
         phase,
         sets_data: sets,
-        metcon_sel: metconSel
-      }, { onConflict: 'user_id,session_date,day_idx,phase' })
+        metcon_sel: metconSel,
+        coach_context: ctx
+      }
+      let up = await supabase.from('workout_sessions').upsert(sessionRow, { onConflict: 'user_id,session_date,day_idx,phase' })
+      if (up.error && coachContextColumnError(up.error)) {
+        console.warn('workout_sessions: retrying without coach_context — apply migrations/002_coach_context.sql')
+        up = await supabase.from('workout_sessions').upsert(omitCoachPayloadRow(sessionRow), { onConflict: 'user_id,session_date,day_idx,phase' })
+      }
+      if (up.error) throw new Error(up.error.message || 'workout_sessions save failed')
 
-      await supabase.from('today_log').upsert({
+      const logRow = {
         user_id: USER_ID,
         log_date: today(),
         sets_data: setsByPhase,
         metcon_sel: metconByPhase,
+        coach_context: ctx,
         updated_at: new Date().toISOString()
-      }, { onConflict: 'user_id,log_date' })
+      }
+      up = await supabase.from('today_log').upsert(logRow, { onConflict: 'user_id,log_date' })
+      if (up.error && coachContextColumnError(up.error)) {
+        up = await supabase.from('today_log').upsert(omitCoachPayloadRow(logRow), { onConflict: 'user_id,log_date' })
+      }
+      if (up.error) throw new Error(up.error.message || 'today_log save failed')
 
-      const { data: freshHist } = await supabase.from('workout_sessions').select('*').eq('user_id', USER_ID).order('session_date', { ascending: false }).limit(HISTORY_LIMIT)
-      if (freshHist?.length) {
-        setHistory(freshHist)
+      const histQ = await supabase.from('workout_sessions').select('*').eq('user_id', USER_ID).order('session_date', { ascending: false }).limit(HISTORY_LIMIT)
+      if (histQ.error) throw new Error(histQ.error.message || 'Failed to reload history')
+
+      const freshHist = histQ.data || []
+      setHistory(freshHist)
+      if (freshHist.length) {
         const prMap = recalculatePrsFromSessions(freshHist)
         setPrs(prMap)
         await syncPersonalRecordsToDb(supabase, USER_ID, prMap)
@@ -607,22 +686,59 @@ export default function App() {
   const coachContextBlock = () => {
     const c = coachContext
     const parts = []
-    if (c.running && c.running !== 'normal') parts.push(`Running load: ${c.running}`)
-    if (c.sleep && c.sleep !== 'ok') parts.push(`Sleep/recovery: ${c.sleep}`)
+    if (c.running !== 'normal') parts.push(`Running load: ${c.running}`)
+    const hrs = String(c.sleepHours || '').trim()
+    parts.push(hrs ? `Hours slept (last night): ${hrs}` : 'Hours slept (last night): not specified')
+    parts.push(`Perceived sleep quality: ${c.sleepFeel}`)
     if (c.deload) parts.push('Deload week: yes')
     if (c.race) parts.push('Race week: yes')
-    return parts.length ? `\nAthlete context:\n${parts.map(p => `• ${p}`).join('\n')}` : ''
+    return `\nAthlete context (from session form — also stored in DB):\n${parts.map(p => `• ${p}`).join('\n')}`
   }
 
-  // ─── AI Coaching ───
-  const getCoaching = async () => {
+  const formatSessionBriefForInsight = (h) => {
+    const sd = h.sets_data || {}
+    const lines = []
+    Object.entries(sd).forEach(([k, rows]) => {
+      if (!Array.isArray(rows)) return
+      const best = Math.max(0, ...rows.filter(s => s.done).map(s => Number(s.weight) || 0))
+      if (best > 0) lines.push(`  ${k}: best ${best}lb`)
+    })
+    const ctx = h.coach_context
+    let ctxLine = ''
+    if (ctx && typeof ctx === 'object') {
+      const n = normalizeCoachContext(ctx)
+      ctxLine = `  saved context: run=${n.running}, sleep=${n.sleepHours || '—'}h, feel=${n.sleepFeel}${n.deload ? ', deload' : ''}${n.race ? ', race' : ''}\n`
+    }
+    return `— ${h.session_date} · ${h.phase} · day ${Number(h.day_idx) + 1} (${h.day_name})\n${ctxLine}${lines.join('\n') || '  (no weights logged)'}`
+  }
+
+  const parseCoachResponse = (data, updateLastMsg = false) => {
+    if (data.content && data.content[0]) {
+      const t = data.content[0].text
+      if (updateLastMsg) setLastCoachMsg(t)
+      try {
+        const stripped = t.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '')
+        setCoachStructured(JSON.parse(stripped))
+        setCoachPlain('')
+      } catch {
+        setCoachStructured(null)
+        setCoachPlain(t)
+      }
+    } else if (data.error) {
+      setCoachPlain('Error: ' + (data.error.message || JSON.stringify(data.error)))
+    } else {
+      setCoachPlain(JSON.stringify(data, null, 2))
+    }
+  }
+
+  // ─── AI Insights (INSIGHT tab) ───
+  const getInsightsSession = async () => {
     setAiLoading(true)
     setCoachPlain('')
     setCoachStructured(null)
     setFollowUp('')
     try {
       const exerciseLines = buildExerciseLines(dayData.circuits)
-
       const sameDayHist = history.filter(h => h.day_idx === activeDay && (h.phase || 'hypertrophy') === phase).slice(0, 3)
       let histBlock = 'No previous sessions for this day.'
       if (sameDayHist.length > 0) {
@@ -636,26 +752,20 @@ export default function App() {
         }).join('\n\n')
       }
 
-      const prompt = `You are a strength coach reviewing a workout session. Be direct and specific.
-
-TODAY'S WORKOUT — ${phase.toUpperCase()} PHASE — Day ${activeDay + 1}: ${dayData.name}
+      const prompt = `You are a strength coach reviewing a single workout session. Be direct and specific.
 ${coachContextBlock()}
 
-Exercises logged today:
+TODAY — ${phase.toUpperCase()} PHASE — Day ${activeDay + 1}: ${dayData.name}
+
+Exercises logged:
 ${exerciseLines.join('\n')}
 
-Last 3 sessions of this same day:
+Last 3 sessions of this same day/phase:
 ${histBlock}
 
-Respond with bullet points:
-• Weight recommendation for each exercise (up/down/hold)
-• Flag any rep drops greater than 20% from previous sessions
-• Note any PRs hit today
-• One-sentence session grade (A/B/C/D)
-• One specific goal for next session`
+Return ONLY valid JSON with: grade (A/B/C/D), summary (one sentence), bullets (string array: recommendations per lift, rep-drop flags, PR notes), risks (string array), next_session_focus (one string).`
 
       setLastUserPrompt(prompt)
-
       const res = await fetch('/api/coach', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -674,73 +784,64 @@ Respond with bullet points:
         setAiLoading(false)
         return
       }
-      if (data.content && data.content[0]) {
-        const t = data.content[0].text
-        setLastCoachMsg(t)
-        try {
-          const stripped = t.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '')
-          setCoachStructured(JSON.parse(stripped))
-          setCoachPlain('')
-        } catch {
-          setCoachStructured(null)
-          setCoachPlain(t)
-        }
-      } else if (data.error) {
-        setCoachPlain('Error: ' + (data.error.message || JSON.stringify(data.error)))
-      } else {
-        setCoachPlain(JSON.stringify(data, null, 2))
-      }
+      parseCoachResponse(data, true)
     } catch (e) {
       setCoachPlain('Error: ' + e.message)
     }
     setAiLoading(false)
   }
 
-  const getCircuitCoaching = async (circuit) => {
-    if (circuit.isMetcon) return
-    setCircuitCoachId(circuit.id)
-    setCoachStructured(null)
+  const getInsightsWeek = async () => {
+    setAiLoading(true)
     setCoachPlain('')
+    setCoachStructured(null)
+    setFollowUp('')
     try {
-      const exerciseLines = buildExerciseLines([circuit])
-      const prompt = `You are a strength coach. One block only — be brief (5 bullets max).
+      const cutoff = new Date()
+      cutoff.setDate(cutoff.getDate() - 7)
+      const cs = cutoff.getFullYear() + '-' + String(cutoff.getMonth() + 1).padStart(2, '0') + '-' + String(cutoff.getDate()).padStart(2, '0')
+      const recent = history.filter(h => (h.session_date || '') >= cs).sort((a, b) => (b.session_date || '').localeCompare(a.session_date || ''))
+      const block = recent.map(formatSessionBriefForInsight).join('\n\n')
+      const prLines = Object.entries(prs).slice(0, 40).map(([id, v]) => `${id}: ${v.weight}lb @ ${v.date}`).join('\n')
 
-PHASE: ${phase} — Day ${activeDay + 1}: ${dayData.name}
-BLOCK: ${circuit.label}
+      const prompt = `You are a strength coach. The athlete follows a 4-day lifting program (hypertrophy or strength blocks) while running heavily. Review their last 7 CALENDAR DAYS of saved sessions.
 ${coachContextBlock()}
+Note: "Athlete context" above is how they feel RIGHT NOW in the app (today's form); calendar sessions below include the coach_context saved on each day when they hit save.
 
-Logged:
-${exerciseLines.join('\n')}
+App phase toggle (where they are browsing): ${phase}
 
-Give: form cue, weight adjustment if any, and one priority for next time.`
+PR snapshot:
+${prLines || 'none'}
 
+Sessions in window (${recent.length}):
+${block || 'No sessions in the last 7 days.'}
+
+Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the week), bullets (4-10 strings: patterns, fatigue, lift trends, weekly adjustments), risks (string array), next_session_focus (priority for the next training day).`
+
+      setLastUserPrompt(prompt)
       const res = await fetch('/api/coach', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, jsonMode: false })
+        body: JSON.stringify({ prompt, jsonMode: true })
       })
       let data
       try {
         data = await res.json()
       } catch {
         setCoachPlain('Error: Could not read coach response')
-        setCircuitCoachId(null)
+        setAiLoading(false)
         return
       }
       if (!res.ok) {
         setCoachPlain('Error: ' + (data.error?.message || res.statusText))
-        setCircuitCoachId(null)
+        setAiLoading(false)
         return
       }
-      if (data.content && data.content[0]) {
-        setCoachPlain(`[${circuit.label}]\n\n${data.content[0].text}`)
-        setLastCoachMsg(data.content[0].text)
-        setLastUserPrompt(prompt)
-      }
+      parseCoachResponse(data, true)
     } catch (e) {
       setCoachPlain('Error: ' + e.message)
     }
-    setCircuitCoachId(null)
+    setAiLoading(false)
   }
 
   const submitFollowUp = async () => {
@@ -846,7 +947,8 @@ Give: form cue, weight adjustment if any, and one priority for next time.`
       history,
       setsByPhase,
       metconByPhase,
-      logDate: today()
+      logDate: today(),
+      coachContext: normalizeCoachContext(coachContext)
     })
     downloadJson(payload)
   }
@@ -872,20 +974,31 @@ Give: form cue, weight adjustment if any, and one priority for next time.`
       setPrs(prFinal)
       if (d.todayLog?.sets_data) setSetsByPhase(migrateTodayLogPayload(d.todayLog.sets_data))
       if (d.todayLog?.metcon_sel) setMetconByPhase(migrateTodayLogPayload(d.todayLog.metcon_sel))
+      if (d.todayLog?.coach_context) setCoachContext(normalizeCoachContext(d.todayLog.coach_context))
 
       if (supabase) {
         await syncPersonalRecordsToDb(supabase, USER_ID, prFinal)
         for (const row of sessions) {
           const { id: _id, ...rest } = row
-          await supabase.from('workout_sessions').upsert(rest, { onConflict: 'user_id,session_date,day_idx,phase' })
+          let up = await supabase.from('workout_sessions').upsert(rest, { onConflict: 'user_id,session_date,day_idx,phase' })
+          if (up.error && coachContextColumnError(up.error)) {
+            up = await supabase.from('workout_sessions').upsert(omitCoachPayloadRow(rest), { onConflict: 'user_id,session_date,day_idx,phase' })
+          }
+          if (up.error) throw new Error(up.error.message || 'workout_sessions import failed')
         }
-        await supabase.from('today_log').upsert({
+        const importLogRow = {
           user_id: USER_ID,
           log_date: today(),
           sets_data: migrateTodayLogPayload(d.todayLog?.sets_data || {}),
           metcon_sel: migrateTodayLogPayload(d.todayLog?.metcon_sel || {}),
+          coach_context: normalizeCoachContext(d.todayLog?.coach_context || {}),
           updated_at: new Date().toISOString()
-        }, { onConflict: 'user_id,log_date' })
+        }
+        let logUp = await supabase.from('today_log').upsert(importLogRow, { onConflict: 'user_id,log_date' })
+        if (logUp.error && coachContextColumnError(logUp.error)) {
+          logUp = await supabase.from('today_log').upsert(omitCoachPayloadRow(importLogRow), { onConflict: 'user_id,log_date' })
+        }
+        if (logUp.error) throw new Error(logUp.error.message || 'today_log import failed')
       }
       setImportMsg('Imported.')
       setTimeout(() => setImportMsg(''), 3000)
@@ -1001,10 +1114,15 @@ Give: form cue, weight adjustment if any, and one priority for next time.`
     statLabel: { fontSize: 10, color: MUTED, letterSpacing: 1 },
     statValue: { fontSize: 18, fontWeight: 700, color: ACCENT, marginTop: 4 },
     planBox: { background: CARD, border: `1px solid ${BLUE}40`, borderRadius: 6, padding: 12, marginBottom: 12 },
-    miniCoachBtn: (c, loading, pressed) => ({
-      fontSize: 9, padding: '6px 8px', border: `1px solid ${BLUE}`, borderRadius: 4, background: BLUE + '12',
-      color: BLUE, fontFamily: FONT, fontWeight: 700, minHeight: 32, opacity: loading ? 0.5 : 1
-    }),
+    contextCard: {
+      background: CARD, border: `1px solid ${ACCENT}35`, borderRadius: 6, padding: 12, marginBottom: 14
+    },
+    contextHint: { fontSize: 9, color: MUTED, marginTop: 8, lineHeight: 1.45 },
+    sleepRow: { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', marginTop: 10 },
+    sleepInput: {
+      width: 56, padding: '8px 4px', textAlign: 'center', background: '#1a1a1a', border: `1px solid ${BORDER}`,
+      borderRadius: 4, color: TEXT, fontFamily: FONT, fontSize: 15, fontWeight: 700
+    },
     daySelector: { display: 'flex', gap: 6, margin: '8px 0 12px' },
     dayBtn: (active) => ({
       flex: 1, padding: '10px 0', border: 'none', borderRadius: 4, fontFamily: FONT,
@@ -1142,6 +1260,38 @@ Give: form cue, weight adjustment if any, and one priority for next time.`
         {dayData.note && <div style={S.dayNote}>{dayData.note}</div>}
       </div>
 
+      <div style={S.contextCard}>
+        <div style={{ fontSize: 10, fontWeight: 700, color: ACCENT, letterSpacing: 1, marginBottom: 6 }}>SESSION CONTEXT</div>
+        <div style={{ fontSize: 10, color: MUTED }}>Set before you save — stored with this workout for AI.</div>
+        <div style={{ ...S.chipRow, marginTop: 8, marginBottom: 0 }}>
+          <span style={{ fontSize: 8, color: MUTED }}>RUN</span>
+          {['low', 'normal', 'high'].map(o => (
+            <button key={o} type="button" style={S.chipBtn(coachContext.running === o)} onClick={() => setCoachContext(x => ({ ...x, running: o }))}>{o}</button>
+          ))}
+        </div>
+        <div style={S.sleepRow}>
+          <span style={{ fontSize: 8, color: MUTED }}>SLEEP HRS</span>
+          <input
+            type="text"
+            inputMode="decimal"
+            placeholder="—"
+            value={coachContext.sleepHours}
+            onChange={e => setCoachContext(x => ({ ...x, sleepHours: e.target.value }))}
+            style={S.sleepInput}
+            autoComplete="off"
+          />
+          <span style={{ fontSize: 8, color: MUTED }}>FELT</span>
+          {['great', 'good', 'ok', 'poor', 'bad'].map(o => (
+            <button key={o} type="button" style={S.chipBtn(coachContext.sleepFeel === o)} onClick={() => setCoachContext(x => ({ ...x, sleepFeel: o }))}>{o}</button>
+          ))}
+        </div>
+        <div style={{ ...S.chipRow, marginBottom: 0 }}>
+          <button type="button" style={S.chipBtn(coachContext.deload)} onClick={() => setCoachContext(x => ({ ...x, deload: !x.deload }))}>DELOAD</button>
+          <button type="button" style={S.chipBtn(coachContext.race)} onClick={() => setCoachContext(x => ({ ...x, race: !x.race }))}>RACE WK</button>
+        </div>
+        <div style={S.contextHint}>Autosaves with your log. Run the INSIGHT tab after training for AI analysis.</div>
+      </div>
+
       <div style={S.legend}>
         {[['Straight Sets', ACCENT], ['Circuit/Superset', PURPLE], ['Core', GREEN], ['Conditioning', RED]].map(([label, c]) => (
           <div key={label} style={S.legendItem}>
@@ -1166,14 +1316,6 @@ Give: form cue, weight adjustment if any, and one priority for next time.`
                 </div>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                <button
-                  type="button"
-                  style={S.miniCoachBtn(c, circuitCoachId === circuit.id, pressed === 'cc_' + circuit.id)}
-                  onClick={() => { onPress('cc_' + circuit.id); getCircuitCoaching(circuit) }}
-                  disabled={circuit.isMetcon || circuitCoachId === circuit.id}
-                >
-                  {circuitCoachId === circuit.id ? '...' : 'BLOCK'}
-                </button>
                 <button
                   style={S.goalBtn(c, pressed === 'goal_' + circuit.id)}
                   onClick={() => { onPress('goal_' + circuit.id); setNoteOpen(p => ({ ...p, [circuit.id]: !p[circuit.id] })) }}
@@ -1287,54 +1429,12 @@ Give: form cue, weight adjustment if any, and one priority for next time.`
         )
       })}
 
-      <div style={S.chipRow}>
-        <span style={S.chipLabel}>COACH CONTEXT</span>
-        {[
-          ['running', 'RUN', ['normal', 'low', 'high'], { normal: 'normal', low: 'low', high: 'high' }],
-          ['sleep', 'SLEEP', ['ok', 'poor'], { ok: 'ok', poor: 'poor' }],
-        ].map(([key, label, opts, map]) => (
-          <span key={key} style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-            <span style={{ fontSize: 8, color: MUTED }}>{label}</span>
-            {opts.map(o => (
-              <button
-                key={o}
-                type="button"
-                style={S.chipBtn(coachContext[key] === o)}
-                onClick={() => setCoachContext(x => ({ ...x, [key]: o }))}
-              >
-                {map[o] || o}
-              </button>
-            ))}
-          </span>
-        ))}
-        {[
-          ['deload', 'DELOAD'],
-          ['race', 'RACE WK'],
-        ].map(([key, label]) => (
-          <button
-            key={key}
-            type="button"
-            style={S.chipBtn(coachContext[key])}
-            onClick={() => setCoachContext(x => ({ ...x, [key]: !x[key] }))}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
-
       <div style={S.btnRow}>
         <button
-          style={S.saveBtn(pressed === 'save')}
+          style={{ ...S.saveBtn(pressed === 'save'), flex: 1 }}
           onClick={() => { onPress('save'); saveWorkout() }}
         >
           {saveMsg || 'SAVE WORKOUT'}
-        </button>
-        <button
-          style={S.coachBtn(aiLoading, pressed === 'coach')}
-          onClick={() => { if (!aiLoading) { onPress('coach'); getCoaching() } }}
-          disabled={aiLoading}
-        >
-          {aiLoading ? 'ANALYZING...' : 'GET COACHING'}
         </button>
       </div>
 
@@ -1369,10 +1469,40 @@ Give: form cue, weight adjustment if any, and one priority for next time.`
           </div>
         )}
       </div>
+    </>
+  )
+
+  // ─── RENDER: INSIGHT TAB (AI) ───
+  const renderInsights = () => (
+    <>
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 14, fontWeight: 700, letterSpacing: 2 }}>AI INSIGHT</div>
+        <div style={{ fontSize: 10, color: MUTED, marginTop: 4 }}>
+          Session context comes from the WORKOUT tab (running, sleep hours + how it felt, flags). Each saved workout stores that on the server for richer week reviews.
+        </div>
+      </div>
+      <div style={{ display: 'flex', gap: 6, marginBottom: 14, flexWrap: 'wrap' }}>
+        <button type="button" style={S.chipBtn(insightScope === 'session')} onClick={() => setInsightScope('session')}>THIS SESSION</button>
+        <button type="button" style={S.chipBtn(insightScope === 'week')} onClick={() => setInsightScope('week')}>LAST 7 DAYS</button>
+      </div>
+      <div style={{ marginBottom: 14 }}>
+        <button
+          type="button"
+          style={{ ...S.coachBtn(aiLoading, pressed === 'ins'), width: '100%' }}
+          disabled={aiLoading}
+          onClick={() => {
+            onPress('ins')
+            if (insightScope === 'session') getInsightsSession()
+            else getInsightsWeek()
+          }}
+        >
+          {aiLoading ? 'ANALYZING...' : (insightScope === 'session' ? 'RUN SESSION INSIGHT' : 'RUN WEEK INSIGHT')}
+        </button>
+      </div>
 
       {coachStructured && (
         <div style={S.aiPanel}>
-          <div style={S.aiLabel}>AI COACH</div>
+          <div style={S.aiLabel}>INSIGHT</div>
           <div style={{ fontSize: 13, fontWeight: 700, color: ACCENT, marginBottom: 6 }}>Grade: {coachStructured.grade}</div>
           <div style={{ fontSize: 12, marginBottom: 10 }}>{coachStructured.summary}</div>
           {(coachStructured.bullets || []).length > 0 && (
@@ -1391,7 +1521,7 @@ Give: form cue, weight adjustment if any, and one priority for next time.`
 
       {coachPlain && (
         <div style={S.aiPanel}>
-          <div style={S.aiLabel}>AI COACH</div>
+          <div style={S.aiLabel}>INSIGHT</div>
           <div style={S.aiText}>{coachPlain}</div>
         </div>
       )}
@@ -1531,6 +1661,14 @@ Give: form cue, weight adjustment if any, and one priority for next time.`
             <div key={session.id} style={S.histCard}>
               <div style={S.histDay}>Day {session.day_idx + 1} — {session.day_name}</div>
               <div style={S.histMeta}>{session.session_date} · {session.phase}</div>
+              {session.coach_context && typeof session.coach_context === 'object' && (() => {
+                const n = normalizeCoachContext(session.coach_context)
+                return (
+                  <div style={{ fontSize: 9, color: BLUE, marginTop: 4 }}>
+                    Ctx run:{n.running} sleep:{n.sleepHours || '—'}h {n.sleepFeel}{n.deload ? ' · deload' : ''}{n.race ? ' · race' : ''}
+                  </div>
+                )
+              })()}
               {metconLabel && <div style={S.histMetcon}>{metconLabel}</div>}
               {exLines.length > 0 ? (
                 exLines.map((line, i) => <div key={i} style={S.histExLine}>{line}</div>)
@@ -1583,7 +1721,7 @@ Give: form cue, weight adjustment if any, and one priority for next time.`
         </div>
 
         <div style={S.tabs}>
-          {[['workout', 'WORKOUT'], ['prs', 'PRs'], ['log', 'HISTORY'], ['stats', 'STATS']].map(([id, label]) => (
+          {[['workout', 'WORKOUT'], ['insight', 'INSIGHT'], ['prs', 'PRs'], ['log', 'HISTORY'], ['stats', 'STATS']].map(([id, label]) => (
             <button key={id} type="button" style={S.tab(tab === id)} onClick={() => setTab(id)}>{label}</button>
           ))}
         </div>
@@ -1592,6 +1730,7 @@ Give: form cue, weight adjustment if any, and one priority for next time.`
       {/* Scrollable content */}
       <div ref={scrollRef} style={S.scrollArea} onClick={onTapBackground}>
         {tab === 'workout' && renderWorkout()}
+        {tab === 'insight' && renderInsights()}
         {tab === 'prs' && renderPRs()}
         {tab === 'log' && renderHistory()}
         {tab === 'stats' && renderStats()}

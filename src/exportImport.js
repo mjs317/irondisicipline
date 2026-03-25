@@ -1,6 +1,6 @@
 export const EXPORT_VERSION = 1
 
-export function buildExportPayload({ userId, prs, history, setsByPhase, metconByPhase, logDate }) {
+export function buildExportPayload({ userId, prs, history, setsByPhase, metconByPhase, logDate, coachContext }) {
   return {
     version: EXPORT_VERSION,
     exportedAt: new Date().toISOString(),
@@ -10,7 +10,8 @@ export function buildExportPayload({ userId, prs, history, setsByPhase, metconBy
     todayLog: {
       log_date: logDate,
       sets_data: setsByPhase,
-      metcon_sel: metconByPhase
+      metcon_sel: metconByPhase,
+      ...(coachContext != null ? { coach_context: coachContext } : {})
     }
   }
 }

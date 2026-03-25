@@ -16,7 +16,7 @@ Personal workout tracker (React + Vite + Supabase + Vercel) with optional AI coa
 
 | Variable | Purpose |
 |----------|---------|
-| `ANTHROPIC_API_KEY` | Claude API key for **Get coaching**, **follow-up**, **block coach**, and **Generate week weights** |
+| `ANTHROPIC_API_KEY` | Claude API key for **INSIGHT** tab, **follow-up**, and **Generate week weights** |
 
 Set these in Vercel **Project → Settings → Environment Variables** and redeploy.
 
@@ -41,6 +41,12 @@ Hypertrophy and strength sessions on the same calendar day must not overwrite ea
 
 If your constraint name differs, adjust the `DROP CONSTRAINT` line using the name shown in Supabase **Table Editor → workout_sessions → Constraints**.
 
+### `coach_context` on `today_log` and `workout_sessions`
+
+Session form fields (running load, sleep hours, perceived sleep, deload/race flags) are saved as JSON for AI. Apply:
+
+`supabase/migrations/002_coach_context.sql`
+
 ## Local development
 
 ```bash
@@ -64,7 +70,7 @@ Then **Get coaching** and **plan week** work from the Vite app. Without `vercel 
 - **Export / import JSON** backup (PRs tab and Stats tab).
 - **STATS** tab: estimated tonnage, session streak, sessions per ISO week, recent best weights per lift.
 - **AI week plan:** suggests working weights from history + PRs; **Apply this day** / **Apply all days** fills weight fields for the current phase.
-- **Coach context** chips (run load, sleep, deload, race week), **BLOCK** mini-coach per circuit, structured session summary (JSON), and **follow-up** questions.
+- **Session context** on Workout (run load, sleep hours + perceived quality, deload/race); saved as **`coach_context`**. **INSIGHT** tab: analyze this session or last 7 days (JSON + follow-up).
 
 ## Build
 
