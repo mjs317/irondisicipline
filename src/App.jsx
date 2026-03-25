@@ -39,7 +39,6 @@ const colorForType = (t) => {
 // ─── PROGRAM DATA ───
 
 const HYPERTROPHY = [
-  // DAY 1
   {
     name: 'Upper Horizontal',
     tag: 'BENCH · ROWS · PUSH/PULL',
@@ -77,7 +76,6 @@ const HYPERTROPHY = [
       }
     ]
   },
-  // DAY 2
   {
     name: 'Lower Hinge + Glutes',
     tag: 'RDL · GLUTES · HINGE',
@@ -115,7 +113,6 @@ const HYPERTROPHY = [
       }
     ]
   },
-  // DAY 3
   {
     name: 'Upper Vertical + Arms',
     tag: 'PULL-UPS · PRESS · ARMS',
@@ -157,7 +154,6 @@ const HYPERTROPHY = [
       }
     ]
   },
-  // DAY 4
   {
     name: 'Full Body Power',
     tag: 'SQUAT · POWER · CONDITIONING',
@@ -200,7 +196,6 @@ const HYPERTROPHY = [
 ]
 
 const STRENGTH = [
-  // DAY 1
   {
     name: 'Upper Horizontal',
     tag: 'BENCH · ROWS · HEAVY PUSH/PULL',
@@ -235,7 +230,6 @@ const STRENGTH = [
       }
     ]
   },
-  // DAY 2
   {
     name: 'Lower Hinge + Glutes',
     tag: 'DEADLIFT · GLUTES · HEAVY HINGE',
@@ -270,7 +264,6 @@ const STRENGTH = [
       }
     ]
   },
-  // DAY 3
   {
     name: 'Upper Vertical + Arms',
     tag: 'PULL-UPS · PRESS · HEAVY ARMS',
@@ -316,7 +309,6 @@ const STRENGTH = [
       }
     ]
   },
-  // DAY 4
   {
     name: 'Full Body Power',
     tag: 'SQUAT · POWER · HEAVY CONDITIONING',
@@ -375,10 +367,52 @@ export default function App() {
   const [aiLoading, setAiLoading] = useState(false)
   const [saveMsg, setSaveMsg] = useState('')
   const [noteOpen, setNoteOpen] = useState({})
+  const [online, setOnline] = useState(navigator.onLine)
+  const [pressed, setPressed] = useState(null)
   const autoSaveTimer = useRef(null)
+  const pendingSave = useRef(null)
+  const scrollRef = useRef(null)
 
   const days = PHASES[phase]
   const dayData = days[activeDay]
+
+  // ─── Online/offline tracking ───
+  useEffect(() => {
+    const on = () => setOnline(true)
+    const off = () => setOnline(false)
+    window.addEventListener('online', on)
+    window.addEventListener('offline', off)
+    return () => { window.removeEventListener('online', on); window.removeEventListener('offline', off) }
+  }, [])
+
+  // ─── Retry pending save on reconnect ───
+  useEffect(() => {
+    if (online && pendingSave.current) {
+      const data = pendingSave.current
+      pendingSave.current = null
+      supabase.from('today_log').upsert(data, { onConflict: 'user_id,log_date' }).catch(() => {})
+    }
+  }, [online])
+
+  // ─── Dismiss keyboard on scroll ───
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    let ticking = false
+    const onScroll = () => {
+      if (!ticking) {
+        ticking = true
+        requestAnimationFrame(() => {
+          if (document.activeElement && document.activeElement.tagName === 'INPUT') {
+            document.activeElement.blur()
+          }
+          ticking = false
+        })
+      }
+    }
+    el.addEventListener('scroll', onScroll, { passive: true })
+    return () => el.removeEventListener('scroll', onScroll)
+  }, [loaded])
 
   // ─── Load data on mount ───
   useEffect(() => {
@@ -411,18 +445,28 @@ export default function App() {
     if (!loaded) return
     if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
     autoSaveTimer.current = setTimeout(async () => {
+      const payload = {
+        user_id: USER_ID,
+        log_date: today(),
+        sets_data: sets,
+        metcon_sel: metconSel,
+        updated_at: new Date().toISOString()
+      }
       try {
-        await supabase.from('today_log').upsert({
-          user_id: USER_ID,
-          log_date: today(),
-          sets_data: sets,
-          metcon_sel: metconSel,
-          updated_at: new Date().toISOString()
-        }, { onConflict: 'user_id,log_date' })
-      } catch (e) { console.error('Auto-save error:', e) }
+        await supabase.from('today_log').upsert(payload, { onConflict: 'user_id,log_date' })
+        pendingSave.current = null
+      } catch (e) {
+        pendingSave.current = payload
+        console.error('Auto-save error:', e)
+      }
     }, 2000)
     return () => { if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current) }
   }, [sets, metconSel, loaded])
+
+  // ─── Scroll to top on tab/day change ───
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = 0
+  }, [tab, activeDay, phase])
 
   // ─── Set row updates ───
   const updateSet = useCallback((circuitId, exId, idx, field, val, totalSets) => {
@@ -590,7 +634,6 @@ Respond with bullet points:
     return { done, total }
   }
 
-  // ─── Gather all exercises from both phases for PRs tab ───
   const allExercisesByDay = () => {
     const result = [[], [], [], []]
     const seen = new Set()
@@ -611,32 +654,64 @@ Respond with bullet points:
     return result
   }
 
+  // ─── Tap feedback helper ───
+  const onPress = (id) => { setPressed(id); setTimeout(() => setPressed(null), 150) }
+
+  // ─── Tap outside inputs to dismiss keyboard ───
+  const onTapBackground = (e) => {
+    if (e.target.tagName !== 'INPUT' && document.activeElement && document.activeElement.tagName === 'INPUT') {
+      document.activeElement.blur()
+    }
+  }
+
   // ─── STYLES ───
   const S = {
-    app: { fontFamily: FONT, background: BG, color: TEXT, minHeight: '100vh', maxWidth: 600, margin: '0 auto', padding: '0 12px 80px', WebkitFontSmoothing: 'antialiased' },
-    header: { padding: '16px 0 8px' },
+    shell: {
+      fontFamily: FONT, background: BG, color: TEXT, height: '100%',
+      display: 'flex', flexDirection: 'column', maxWidth: 600, margin: '0 auto',
+      WebkitFontSmoothing: 'antialiased', position: 'relative', overflow: 'hidden'
+    },
+    stickyTop: {
+      flexShrink: 0, background: BG, zIndex: 10,
+      paddingTop: 'env(safe-area-inset-top, 0px)',
+      paddingLeft: 'env(safe-area-inset-left, 0px)',
+      paddingRight: 'env(safe-area-inset-right, 0px)',
+    },
+    scrollArea: {
+      flex: 1, overflowY: 'auto', overflowX: 'hidden',
+      WebkitOverflowScrolling: 'touch', overscrollBehavior: 'contain',
+      padding: '0 12px',
+      paddingBottom: 'calc(24px + env(safe-area-inset-bottom, 0px))',
+    },
+    offlineBanner: {
+      background: RED + '30', borderBottom: `1px solid ${RED}50`,
+      padding: '6px 12px', fontSize: 10, color: RED, textAlign: 'center',
+      fontFamily: FONT, fontWeight: 700, letterSpacing: 1
+    },
+    header: { padding: '12px 12px 6px' },
     titleRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' },
-    titleLeft: {},
-    h1: { fontSize: 16, fontWeight: 700, letterSpacing: 2, color: ACCENT, margin: 0 },
-    h2: { fontSize: 10, fontWeight: 400, letterSpacing: 3, color: MUTED, margin: '2px 0 0' },
+    h1: { fontSize: 15, fontWeight: 700, letterSpacing: 2, color: ACCENT, margin: 0 },
+    h2: { fontSize: 9, fontWeight: 400, letterSpacing: 3, color: MUTED, margin: '2px 0 0' },
     dateText: { fontSize: 10, color: MUTED, textAlign: 'right' },
     phaseText: { fontSize: 10, color: ACCENT, textAlign: 'right', marginTop: 2 },
-    phaseToggle: { display: 'flex', gap: 6, margin: '10px 0 6px' },
+    phaseToggle: { display: 'flex', gap: 6, margin: '8px 0 6px', padding: '0' },
     phaseBtn: (active) => ({
-      flex: 1, padding: '8px 4px', border: 'none', borderRadius: 4, cursor: 'pointer', fontFamily: FONT,
+      flex: 1, padding: '10px 4px', border: 'none', borderRadius: 4, fontFamily: FONT,
       fontSize: 10, fontWeight: 700, letterSpacing: 1, textTransform: 'uppercase',
-      background: active ? ACCENT : '#1a1a1a', color: active ? '#000' : MUTED
+      background: active ? ACCENT : '#1a1a1a', color: active ? '#000' : MUTED,
+      minHeight: 44, display: 'flex', alignItems: 'center', justifyContent: 'center'
     }),
-    tabs: { display: 'flex', gap: 0, borderBottom: `1px solid ${BORDER}`, marginBottom: 12 },
+    tabs: { display: 'flex', gap: 0, borderBottom: `1px solid ${BORDER}`, padding: '0 12px' },
     tab: (active) => ({
-      flex: 1, padding: '10px 0', border: 'none', borderBottom: active ? `2px solid ${ACCENT}` : '2px solid transparent',
+      flex: 1, padding: '12px 0', border: 'none', borderBottom: active ? `2px solid ${ACCENT}` : '2px solid transparent',
       background: 'transparent', color: active ? ACCENT : MUTED, fontFamily: FONT, fontSize: 11,
-      fontWeight: 700, letterSpacing: 2, cursor: 'pointer', textAlign: 'center'
+      fontWeight: 700, letterSpacing: 2, textAlign: 'center', minHeight: 44
     }),
     daySelector: { display: 'flex', gap: 6, margin: '8px 0 12px' },
     dayBtn: (active) => ({
-      flex: 1, padding: '8px 0', border: 'none', borderRadius: 4, cursor: 'pointer', fontFamily: FONT,
-      background: active ? ACCENT : '#1a1a1a', color: active ? '#000' : MUTED, textAlign: 'center'
+      flex: 1, padding: '10px 0', border: 'none', borderRadius: 4, fontFamily: FONT,
+      background: active ? ACCENT : '#1a1a1a', color: active ? '#000' : MUTED,
+      textAlign: 'center', minHeight: 54
     }),
     dayBtnSm: { fontSize: 8, letterSpacing: 1, display: 'block', marginBottom: 2 },
     dayBtnLg: { fontSize: 20, fontWeight: 700, display: 'block' },
@@ -653,76 +728,97 @@ Respond with bullet points:
       background: CARD, border: `2px solid ${c}`, borderRadius: 6, marginBottom: 12, overflow: 'hidden'
     }),
     circuitHeader: (c) => ({
-      padding: '8px 10px', background: c + '18', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 4
+      padding: '10px 10px', background: c + '18', display: 'flex', justifyContent: 'space-between',
+      alignItems: 'center', flexWrap: 'wrap', gap: 4, minHeight: 48
     }),
     circuitLabel: (c) => ({ fontSize: 10, fontWeight: 700, color: c, letterSpacing: 1 }),
     circuitMeta: { fontSize: 9, color: MUTED, marginTop: 2 },
     circuitDone: (complete) => ({
-      fontSize: 10, fontWeight: 700, color: complete ? GREEN : MUTED, minWidth: 40, textAlign: 'right'
+      fontSize: 11, fontWeight: 700, color: complete ? GREEN : MUTED, minWidth: 44, textAlign: 'right'
     }),
-    goalBtn: (c) => ({
-      fontSize: 9, padding: '2px 8px', border: `1px solid ${c}`, borderRadius: 3, background: 'transparent',
-      color: c, cursor: 'pointer', fontFamily: FONT, fontWeight: 700, letterSpacing: 1, marginLeft: 6
+    goalBtn: (c, isPressed) => ({
+      fontSize: 10, padding: '6px 12px', border: `1px solid ${c}`, borderRadius: 4, background: 'transparent',
+      color: c, fontFamily: FONT, fontWeight: 700, letterSpacing: 1, marginLeft: 6,
+      minHeight: 32, minWidth: 52, display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+      opacity: isPressed ? 0.6 : 1, transform: isPressed ? 'scale(0.95)' : 'none',
+      transition: 'opacity 0.1s, transform 0.1s'
     }),
     coachNote: (c) => ({
-      padding: '8px 10px', fontSize: 11, color: TEXT, background: c + '10', borderTop: `1px solid ${c}30`,
+      padding: '10px 12px', fontSize: 12, color: TEXT, background: c + '10', borderTop: `1px solid ${c}30`,
       lineHeight: 1.5
     }),
-    exerciseBlock: { padding: '10px 10px 6px' },
-    exerciseHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
+    exerciseBlock: { padding: '10px 10px 8px' },
+    exerciseHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
     exerciseName: { fontSize: 13, fontWeight: 700 },
     exerciseTarget: { fontSize: 9, color: MUTED, marginTop: 1 },
-    prBadge: { fontSize: 9, fontWeight: 700, color: ACCENT, background: ACCENT + '20', padding: '2px 6px', borderRadius: 3 },
-    colHeaders: { display: 'grid', gridTemplateColumns: '30px 1fr 1fr 36px', gap: 4, marginBottom: 4, padding: '0 2px' },
+    prBadge: { fontSize: 9, fontWeight: 700, color: ACCENT, background: ACCENT + '20', padding: '3px 8px', borderRadius: 3 },
+    colHeaders: { display: 'grid', gridTemplateColumns: '30px 1fr 1fr 44px', gap: 6, marginBottom: 6, padding: '0 2px' },
     colHeader: { fontSize: 8, color: MUTED, letterSpacing: 1, textAlign: 'center' },
-    setRow: { display: 'grid', gridTemplateColumns: '30px 1fr 1fr 36px', gap: 4, marginBottom: 4, alignItems: 'center', padding: '0 2px' },
-    setNum: { fontSize: 11, color: MUTED, textAlign: 'center' },
+    setRow: { display: 'grid', gridTemplateColumns: '30px 1fr 1fr 44px', gap: 6, marginBottom: 6, alignItems: 'center', padding: '0 2px' },
+    setNum: { fontSize: 12, color: MUTED, textAlign: 'center', fontWeight: 700 },
     setInput: (done) => ({
-      width: '100%', padding: '6px 4px', border: done ? `1px solid ${GREEN}50` : `1px solid ${BORDER}`,
-      borderRadius: 3, background: done ? GREEN + '15' : '#1a1a1a', color: TEXT, fontFamily: FONT,
-      fontSize: 14, fontWeight: 700, textAlign: 'center', outline: 'none'
+      width: '100%', padding: '8px 4px',
+      border: done ? `1px solid ${GREEN}50` : `1px solid ${BORDER}`,
+      borderRadius: 4, background: done ? GREEN + '15' : '#1a1a1a', color: TEXT, fontFamily: FONT,
+      fontSize: 16, fontWeight: 700, textAlign: 'center', outline: 'none',
+      minHeight: 40
     }),
-    checkBtn: (done) => ({
-      width: 30, height: 30, border: done ? `2px solid ${GREEN}` : `2px solid ${BORDER}`, borderRadius: 4,
-      background: done ? GREEN : 'transparent', color: done ? '#000' : MUTED, cursor: 'pointer',
-      fontFamily: FONT, fontSize: 14, fontWeight: 700, display: 'flex', alignItems: 'center',
-      justifyContent: 'center', margin: '0 auto'
+    checkBtn: (done, isPressed) => ({
+      width: 44, height: 44, border: done ? `2px solid ${GREEN}` : `2px solid ${BORDER}`, borderRadius: 6,
+      background: done ? GREEN : 'transparent', color: done ? '#000' : MUTED,
+      fontFamily: FONT, fontSize: 18, fontWeight: 700, display: 'flex', alignItems: 'center',
+      justifyContent: 'center', margin: '0 auto', padding: 0,
+      opacity: isPressed ? 0.6 : 1, transform: isPressed ? 'scale(0.9)' : 'none',
+      transition: 'opacity 0.1s, transform 0.1s'
     }),
     divider: (c) => ({ height: 1, background: c + '40', margin: '8px 0' }),
     metconCard: (selected) => ({
-      display: 'flex', alignItems: 'flex-start', gap: 10, padding: '10px 12px', margin: '6px 10px',
-      borderRadius: 6, cursor: 'pointer', border: selected ? `2px solid ${GREEN}` : `2px solid ${BORDER}`,
-      background: selected ? GREEN + '15' : '#1a1a1a', transition: 'all 0.15s ease'
+      display: 'flex', alignItems: 'flex-start', gap: 10, padding: '12px', margin: '6px 10px',
+      borderRadius: 6, border: selected ? `2px solid ${GREEN}` : `2px solid ${BORDER}`,
+      background: selected ? GREEN + '15' : '#1a1a1a', transition: 'all 0.15s ease',
+      minHeight: 52
     }),
     metconBadge: (selected) => ({
-      width: 28, height: 28, borderRadius: 4, background: selected ? GREEN : '#333',
+      width: 32, height: 32, borderRadius: 6, background: selected ? GREEN : '#333',
       color: selected ? '#000' : MUTED, display: 'flex', alignItems: 'center', justifyContent: 'center',
-      fontSize: 12, fontWeight: 700, fontFamily: FONT, flexShrink: 0
+      fontSize: 13, fontWeight: 700, fontFamily: FONT, flexShrink: 0
     }),
-    metconText: { fontSize: 12, color: TEXT, lineHeight: 1.4 },
+    metconText: { fontSize: 12, color: TEXT, lineHeight: 1.5 },
     btnRow: { display: 'flex', gap: 8, margin: '16px 0' },
-    saveBtn: { flex: 1, padding: '14px', border: 'none', borderRadius: 6, background: ACCENT, color: '#000', fontFamily: FONT, fontSize: 13, fontWeight: 700, letterSpacing: 1, cursor: 'pointer' },
-    coachBtn: (loading) => ({
-      flex: 1, padding: '14px', border: `2px solid ${BLUE}`, borderRadius: 6,
-      background: BLUE + '15', color: BLUE, fontFamily: FONT, fontSize: 13, fontWeight: 700,
-      letterSpacing: 1, cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.6 : 1
+    saveBtn: (isPressed) => ({
+      flex: 1, padding: '16px', border: 'none', borderRadius: 6, background: ACCENT, color: '#000',
+      fontFamily: FONT, fontSize: 14, fontWeight: 700, letterSpacing: 1,
+      minHeight: 52, display: 'flex', alignItems: 'center', justifyContent: 'center',
+      opacity: isPressed ? 0.7 : 1, transform: isPressed ? 'scale(0.98)' : 'none',
+      transition: 'opacity 0.1s, transform 0.1s'
     }),
-    aiPanel: { background: BLUE + '12', border: `1px solid ${BLUE}40`, borderRadius: 6, padding: '12px', marginBottom: 16 },
+    coachBtn: (loading, isPressed) => ({
+      flex: 1, padding: '16px', border: `2px solid ${BLUE}`, borderRadius: 6,
+      background: BLUE + '15', color: BLUE, fontFamily: FONT, fontSize: 14, fontWeight: 700,
+      letterSpacing: 1, opacity: loading ? 0.5 : (isPressed ? 0.7 : 1),
+      minHeight: 52, display: 'flex', alignItems: 'center', justifyContent: 'center',
+      transform: isPressed ? 'scale(0.98)' : 'none', transition: 'opacity 0.1s, transform 0.1s'
+    }),
+    aiPanel: { background: BLUE + '12', border: `1px solid ${BLUE}40`, borderRadius: 6, padding: '14px', marginBottom: 16 },
     aiLabel: { fontSize: 10, fontWeight: 700, color: BLUE, letterSpacing: 2, marginBottom: 8 },
     aiText: { fontSize: 12, color: TEXT, whiteSpace: 'pre-wrap', lineHeight: 1.6 },
     prSection: { marginBottom: 20 },
-    prSectionHeader: { fontSize: 12, fontWeight: 700, color: ACCENT, letterSpacing: 2, padding: '8px 0', borderBottom: `1px solid ${BORDER}`, marginBottom: 8 },
-    prRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0', borderBottom: `1px solid ${BORDER}10` },
+    prSectionHeader: { fontSize: 12, fontWeight: 700, color: ACCENT, letterSpacing: 2, padding: '10px 0', borderBottom: `1px solid ${BORDER}`, marginBottom: 8 },
+    prRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: `1px solid ${BORDER}10`, minHeight: 44 },
     prName: { fontSize: 12, color: TEXT },
     prWeight: { fontSize: 16, fontWeight: 700, color: ACCENT },
     prDate: { fontSize: 9, color: MUTED },
-    emptyText: { textAlign: 'center', color: MUTED, fontSize: 13, marginTop: 40 },
-    histCard: { background: CARD, border: `1px solid ${BORDER}`, borderRadius: 6, padding: '12px', marginBottom: 10, position: 'relative' },
+    emptyText: { textAlign: 'center', color: MUTED, fontSize: 13, marginTop: 40, lineHeight: 1.6 },
+    histCard: { background: CARD, border: `1px solid ${BORDER}`, borderRadius: 6, padding: '14px', marginBottom: 10, position: 'relative' },
     histDay: { fontSize: 13, fontWeight: 700 },
     histMeta: { fontSize: 10, color: MUTED, marginTop: 2 },
-    histMetcon: { position: 'absolute', top: 12, right: 12, fontSize: 9, fontWeight: 700, color: GREEN },
+    histMetcon: { position: 'absolute', top: 14, right: 14, fontSize: 9, fontWeight: 700, color: GREEN },
     histExLine: { fontSize: 11, color: MUTED, marginTop: 4 },
-    loadingScreen: { display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', fontFamily: FONT, color: ACCENT, fontSize: 16, letterSpacing: 3, background: BG }
+    loadingScreen: {
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      height: '100%', fontFamily: FONT, color: ACCENT, fontSize: 16,
+      letterSpacing: 3, background: BG
+    }
   }
 
   if (!loaded) {
@@ -732,7 +828,6 @@ Respond with bullet points:
   // ─── RENDER: WORKOUT TAB ───
   const renderWorkout = () => (
     <>
-      {/* Day selector */}
       <div style={S.daySelector}>
         {days.map((d, i) => (
           <button key={i} style={S.dayBtn(activeDay === i)} onClick={() => setActiveDay(i)}>
@@ -742,7 +837,6 @@ Respond with bullet points:
         ))}
       </div>
 
-      {/* Day header */}
       <div style={S.dayHeader}>
         <div style={S.dayNum}>DAY {activeDay + 1}</div>
         <div style={S.dayTag}>{dayData.tag}</div>
@@ -750,7 +844,6 @@ Respond with bullet points:
         {dayData.note && <div style={S.dayNote}>{dayData.note}</div>}
       </div>
 
-      {/* Legend */}
       <div style={S.legend}>
         {[['Straight Sets', ACCENT], ['Circuit/Superset', PURPLE], ['Core', GREEN], ['Conditioning', RED]].map(([label, c]) => (
           <div key={label} style={S.legendItem}>
@@ -760,7 +853,6 @@ Respond with bullet points:
         ))}
       </div>
 
-      {/* Circuit cards */}
       {dayData.circuits.map(circuit => {
         const c = colorForType(circuit.type)
         const dc = circuitDoneCount(circuit)
@@ -768,7 +860,6 @@ Respond with bullet points:
 
         return (
           <div key={circuit.id} style={S.circuitCard(c)}>
-            {/* Circuit header */}
             <div style={S.circuitHeader(c)}>
               <div style={{ flex: 1 }}>
                 <div style={S.circuitLabel(c)}>{circuit.label.toUpperCase()}</div>
@@ -777,7 +868,10 @@ Respond with bullet points:
                 </div>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <button style={S.goalBtn(c)} onClick={() => setNoteOpen(p => ({ ...p, [circuit.id]: !p[circuit.id] }))}>
+                <button
+                  style={S.goalBtn(c, pressed === 'goal_' + circuit.id)}
+                  onClick={() => { onPress('goal_' + circuit.id); setNoteOpen(p => ({ ...p, [circuit.id]: !p[circuit.id] })) }}
+                >
                   GOAL
                 </button>
                 <div style={S.circuitDone(isComplete)}>
@@ -789,12 +883,10 @@ Respond with bullet points:
               </div>
             </div>
 
-            {/* Coach note (toggleable) */}
             {noteOpen[circuit.id] && (
               <div style={S.coachNote(c)}>{circuit.coachNote}</div>
             )}
 
-            {/* Metcon UI */}
             {circuit.isMetcon ? (
               <div style={{ padding: '6px 0' }}>
                 {circuit.exercises.map(ex => {
@@ -810,7 +902,6 @@ Respond with bullet points:
                 })}
               </div>
             ) : (
-              /* Regular exercises */
               <div>
                 {circuit.exercises.map((ex, exIdx) => {
                   const key = circuit.id + '__' + ex.id
@@ -837,28 +928,43 @@ Respond with bullet points:
                         </div>
                         {Array.from({ length: circuit.sets }, (_, i) => {
                           const row = exSets[i] || { weight: '', reps: '', done: false }
+                          const checkId = `check_${circuit.id}_${ex.id}_${i}`
                           return (
                             <div key={i} style={S.setRow}>
                               <div style={S.setNum}>{i + 1}</div>
                               <input
-                                type="tel"
+                                type="text"
                                 inputMode="decimal"
+                                pattern="[0-9]*\.?[0-9]*"
                                 placeholder="—"
+                                autoComplete="off"
+                                autoCorrect="off"
+                                autoCapitalize="off"
+                                spellCheck="false"
+                                enterKeyHint="done"
                                 value={row.weight}
                                 onChange={e => updateSet(circuit.id, ex.id, i, 'weight', e.target.value, circuit.sets)}
+                                onKeyDown={e => { if (e.key === 'Enter') e.target.blur() }}
                                 style={S.setInput(row.done)}
                               />
                               <input
-                                type="tel"
+                                type="text"
                                 inputMode="decimal"
+                                pattern="[0-9]*\.?[0-9]*"
                                 placeholder="—"
+                                autoComplete="off"
+                                autoCorrect="off"
+                                autoCapitalize="off"
+                                spellCheck="false"
+                                enterKeyHint="done"
                                 value={row.reps}
                                 onChange={e => updateSet(circuit.id, ex.id, i, 'reps', e.target.value, circuit.sets)}
+                                onKeyDown={e => { if (e.key === 'Enter') e.target.blur() }}
                                 style={S.setInput(row.done)}
                               />
                               <button
-                                style={S.checkBtn(row.done)}
-                                onClick={() => toggleDone(circuit.id, ex.id, i, circuit.sets)}
+                                style={S.checkBtn(row.done, pressed === checkId)}
+                                onClick={() => { onPress(checkId); toggleDone(circuit.id, ex.id, i, circuit.sets) }}
                               >
                                 {row.done ? '✓' : ''}
                               </button>
@@ -875,17 +981,22 @@ Respond with bullet points:
         )
       })}
 
-      {/* Save + Coach buttons */}
       <div style={S.btnRow}>
-        <button style={S.saveBtn} onClick={saveWorkout}>
+        <button
+          style={S.saveBtn(pressed === 'save')}
+          onClick={() => { onPress('save'); saveWorkout() }}
+        >
           {saveMsg || 'SAVE WORKOUT'}
         </button>
-        <button style={S.coachBtn(aiLoading)} onClick={getCoaching} disabled={aiLoading}>
+        <button
+          style={S.coachBtn(aiLoading, pressed === 'coach')}
+          onClick={() => { if (!aiLoading) { onPress('coach'); getCoaching() } }}
+          disabled={aiLoading}
+        >
           {aiLoading ? 'ANALYZING...' : 'GET COACHING'}
         </button>
       </div>
 
-      {/* AI response */}
       {aiResponse && (
         <div style={S.aiPanel}>
           <div style={S.aiLabel}>AI COACH</div>
@@ -972,44 +1083,49 @@ Respond with bullet points:
 
   // ─── MAIN RENDER ───
   return (
-    <div style={S.app}>
-      {/* Header */}
-      <div style={S.header}>
-        <div style={S.titleRow}>
-          <div style={S.titleLeft}>
-            <div style={S.h1}>IRON DISCIPLINE</div>
-            <div style={S.h2}>WORKOUT TRACKER</div>
-          </div>
-          <div>
-            <div style={S.dateText}>{fmtDate()}</div>
-            <div style={S.phaseText}>
-              {phase === 'hypertrophy' ? 'WK 1-2 · HYPERTROPHY' : 'WK 3-4 · STRENGTH'}
+    <div style={S.shell}>
+      {/* Sticky header + tabs */}
+      <div style={S.stickyTop}>
+        {!online && (
+          <div style={S.offlineBanner}>OFFLINE — data will sync when reconnected</div>
+        )}
+        <div style={S.header}>
+          <div style={S.titleRow}>
+            <div>
+              <div style={S.h1}>IRON DISCIPLINE</div>
+              <div style={S.h2}>WORKOUT TRACKER</div>
+            </div>
+            <div>
+              <div style={S.dateText}>{fmtDate()}</div>
+              <div style={S.phaseText}>
+                {phase === 'hypertrophy' ? 'WK 1-2 · HYPERTROPHY' : 'WK 3-4 · STRENGTH'}
+              </div>
             </div>
           </div>
+
+          <div style={S.phaseToggle}>
+            <button style={S.phaseBtn(phase === 'hypertrophy')} onClick={() => setPhase('hypertrophy')}>
+              WEEKS 1–2 · HYPERTROPHY
+            </button>
+            <button style={S.phaseBtn(phase === 'strength')} onClick={() => setPhase('strength')}>
+              WEEKS 3–4 · STRENGTH
+            </button>
+          </div>
         </div>
 
-        {/* Phase toggle */}
-        <div style={S.phaseToggle}>
-          <button style={S.phaseBtn(phase === 'hypertrophy')} onClick={() => setPhase('hypertrophy')}>
-            WEEKS 1–2 · HYPERTROPHY
-          </button>
-          <button style={S.phaseBtn(phase === 'strength')} onClick={() => setPhase('strength')}>
-            WEEKS 3–4 · STRENGTH
-          </button>
+        <div style={S.tabs}>
+          {[['workout', 'WORKOUT'], ['prs', 'PRs'], ['log', 'HISTORY']].map(([id, label]) => (
+            <button key={id} style={S.tab(tab === id)} onClick={() => setTab(id)}>{label}</button>
+          ))}
         </div>
       </div>
 
-      {/* Tabs */}
-      <div style={S.tabs}>
-        {[['workout', 'WORKOUT'], ['prs', 'PRs'], ['log', 'HISTORY']].map(([id, label]) => (
-          <button key={id} style={S.tab(tab === id)} onClick={() => setTab(id)}>{label}</button>
-        ))}
+      {/* Scrollable content */}
+      <div ref={scrollRef} style={S.scrollArea} onClick={onTapBackground}>
+        {tab === 'workout' && renderWorkout()}
+        {tab === 'prs' && renderPRs()}
+        {tab === 'log' && renderHistory()}
       </div>
-
-      {/* Tab content */}
-      {tab === 'workout' && renderWorkout()}
-      {tab === 'prs' && renderPRs()}
-      {tab === 'log' && renderHistory()}
     </div>
   )
 }
