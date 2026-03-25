@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react'
-import { supabase, USER_ID } from './supabase'
+import { supabase, supabaseReady, USER_ID } from './supabase'
 
 // ─── Colors ───
 const BG      = '#0a0a0a'
@@ -387,7 +387,7 @@ export default function App() {
 
   // ─── Retry pending save on reconnect ───
   useEffect(() => {
-    if (online && pendingSave.current) {
+    if (online && pendingSave.current && supabase) {
       const data = pendingSave.current
       pendingSave.current = null
       supabase.from('today_log').upsert(data, { onConflict: 'user_id,log_date' }).catch(() => {})
@@ -416,6 +416,7 @@ export default function App() {
 
   // ─── Load data on mount ───
   useEffect(() => {
+    if (!supabase) { setLoaded(true); return }
     ;(async () => {
       try {
         const [prRes, histRes, todayRes] = await Promise.all([
@@ -442,7 +443,7 @@ export default function App() {
 
   // ─── Auto-save today log on changes ───
   useEffect(() => {
-    if (!loaded) return
+    if (!loaded || !supabase) return
     if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
     autoSaveTimer.current = setTimeout(async () => {
       const payload = {
@@ -500,6 +501,7 @@ export default function App() {
 
   // ─── Save workout ───
   const saveWorkout = async () => {
+    if (!supabase) { setSaveMsg('ERR: DB not configured'); setTimeout(() => setSaveMsg(''), 3000); return }
     setSaveMsg('SAVING...')
     try {
       const prUpserts = []
@@ -1088,6 +1090,11 @@ Respond with bullet points:
       <div style={S.stickyTop}>
         {!online && (
           <div style={S.offlineBanner}>OFFLINE — data will sync when reconnected</div>
+        )}
+        {!supabaseReady && (
+          <div style={{ background: ACCENT + '30', borderBottom: `1px solid ${ACCENT}50`, padding: '8px 12px', fontSize: 10, color: ACCENT, textAlign: 'center', fontFamily: FONT, fontWeight: 700, letterSpacing: 1, lineHeight: 1.4 }}>
+            DB NOT CONNECTED — set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in Vercel env vars, then redeploy
+          </div>
         )}
         <div style={S.header}>
           <div style={S.titleRow}>
