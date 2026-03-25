@@ -1093,7 +1093,8 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
     chipLabel: { fontSize: 9, color: MUTED, width: '100%', letterSpacing: 1 },
     chipBtn: (on) => ({
       fontSize: 9, padding: '6px 10px', borderRadius: 4, border: `1px solid ${on ? ACCENT : BORDER}`,
-      background: on ? ACCENT + '22' : 'transparent', color: on ? ACCENT : MUTED, fontFamily: FONT, fontWeight: 700
+      background: on ? ACCENT + '22' : 'transparent', color: on ? ACCENT : MUTED, fontFamily: FONT, fontWeight: 700,
+      minHeight: 28, boxSizing: 'border-box', lineHeight: 1.2
     }),
     statCard: {
       background: CARD, border: `1px solid ${BORDER}`, borderRadius: 6, padding: 12, marginBottom: 10
@@ -1102,14 +1103,20 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
     statValue: { fontSize: 18, fontWeight: 700, color: ACCENT, marginTop: 4 },
     planBox: { background: CARD, border: `1px solid ${BLUE}40`, borderRadius: 6, padding: 12, marginBottom: 12 },
     contextCard: {
-      background: CARD, border: `1px solid ${ACCENT}35`, borderRadius: 6, padding: 12, marginBottom: 14
+      background: CARD, border: `1px solid ${ACCENT}35`, borderRadius: 6, padding: '10px 12px 12px', marginBottom: 14,
+      display: 'flex', flexDirection: 'column', gap: 0
     },
-    contextHint: { fontSize: 9, color: MUTED, marginTop: 8, lineHeight: 1.45 },
-    sleepRow: { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', marginTop: 10 },
-    sleepInput: {
-      width: 56, padding: '8px 4px', textAlign: 'center', background: '#1a1a1a', border: `1px solid ${BORDER}`,
-      borderRadius: 4, color: TEXT, fontFamily: FONT, fontSize: 15, fontWeight: 700
+    contextHint: { fontSize: 9, color: MUTED, marginTop: 10, lineHeight: 1.45, paddingTop: 2, borderTop: `1px solid ${BORDER}` },
+    contextField: { marginBottom: 12 },
+    contextFieldLabel: {
+      display: 'block', fontSize: 8, color: MUTED, letterSpacing: 1.2, textTransform: 'uppercase', marginBottom: 6
     },
+    contextInput: {
+      width: 64, minWidth: 64, minHeight: 28, boxSizing: 'border-box', padding: '0 8px',
+      textAlign: 'center', background: '#1a1a1a', border: `1px solid ${BORDER}`,
+      borderRadius: 4, color: TEXT, fontFamily: FONT, fontSize: 11, fontWeight: 600
+    },
+    contextChipWrap: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' },
     daySelector: { display: 'flex', gap: 6, margin: '8px 0 12px' },
     dayBtn: (active) => ({
       flex: 1, padding: '10px 0', border: 'none', borderRadius: 4, fontFamily: FONT,
@@ -1248,46 +1255,63 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
       </div>
 
       <div style={S.contextCard}>
-        <div style={{ fontSize: 10, fontWeight: 700, color: ACCENT, letterSpacing: 1, marginBottom: 6 }}>SESSION CONTEXT</div>
-        <div style={{ fontSize: 10, color: MUTED }}>Set before you save — stored with this workout for AI.</div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginTop: 8, marginBottom: 4 }}>
-          <span style={{ fontSize: 8, color: MUTED }}>RUN (MI)</span>
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: ACCENT, letterSpacing: 1, marginBottom: 4 }}>SESSION CONTEXT</div>
+          <div style={{ fontSize: 10, color: MUTED, lineHeight: 1.4 }}>Set before you save — stored with this workout for AI.</div>
+        </div>
+
+        <div style={S.contextField}>
+          <span style={S.contextFieldLabel}>Run — miles</span>
           <input
             type="text"
             inputMode="decimal"
-            placeholder="miles"
+            placeholder="0"
             value={coachContext.runMiles ?? ''}
             onChange={e => setCoachContext(x => ({ ...x, runMiles: e.target.value }))}
-            style={{ ...S.sleepInput, width: 56 }}
+            style={S.contextInput}
             autoComplete="off"
           />
         </div>
-        <div style={{ ...S.chipRow, marginTop: 0, marginBottom: 0, flexWrap: 'wrap' }}>
-          <span style={{ fontSize: 8, color: MUTED }}>TYPE</span>
-          {RUN_TYPES.map(o => (
-            <button key={o} type="button" style={S.chipBtn((coachContext.runType ?? 'off') === o)} onClick={() => setCoachContext(x => ({ ...x, runType: o }))}>{o}</button>
-          ))}
+
+        <div style={S.contextField}>
+          <span style={S.contextFieldLabel}>Run type</span>
+          <div style={S.contextChipWrap}>
+            {RUN_TYPES.map(o => (
+              <button key={o} type="button" style={S.chipBtn((coachContext.runType ?? 'off') === o)} onClick={() => setCoachContext(x => ({ ...x, runType: o }))}>{o}</button>
+            ))}
+          </div>
         </div>
-        <div style={S.sleepRow}>
-          <span style={{ fontSize: 8, color: MUTED }}>SLEEP HRS</span>
+
+        <div style={S.contextField}>
+          <span style={S.contextFieldLabel}>Sleep — hours</span>
           <input
             type="text"
             inputMode="decimal"
             placeholder="—"
             value={coachContext.sleepHours}
             onChange={e => setCoachContext(x => ({ ...x, sleepHours: e.target.value }))}
-            style={S.sleepInput}
+            style={S.contextInput}
             autoComplete="off"
           />
-          <span style={{ fontSize: 8, color: MUTED }}>FELT</span>
-          {['great', 'good', 'ok', 'poor', 'bad'].map(o => (
-            <button key={o} type="button" style={S.chipBtn(coachContext.sleepFeel === o)} onClick={() => setCoachContext(x => ({ ...x, sleepFeel: o }))}>{o}</button>
-          ))}
         </div>
-        <div style={{ ...S.chipRow, marginBottom: 0 }}>
-          <button type="button" style={S.chipBtn(coachContext.deload)} onClick={() => setCoachContext(x => ({ ...x, deload: !x.deload }))}>DELOAD</button>
-          <button type="button" style={S.chipBtn(coachContext.race)} onClick={() => setCoachContext(x => ({ ...x, race: !x.race }))}>RACE WK</button>
+
+        <div style={S.contextField}>
+          <span style={S.contextFieldLabel}>Sleep — how it felt</span>
+          <div style={S.contextChipWrap}>
+            {['great', 'good', 'ok', 'poor', 'bad'].map(o => (
+              <button key={o} type="button" style={S.chipBtn(coachContext.sleepFeel === o)} onClick={() => setCoachContext(x => ({ ...x, sleepFeel: o }))}>{o}</button>
+            ))}
+          </div>
         </div>
+
+        <div style={{ ...S.contextField, marginBottom: 0 }}>
+          <span style={S.contextFieldLabel}>Program flags</span>
+          <div style={S.contextChipWrap}>
+            <button type="button" style={S.chipBtn(coachContext.deload)} onClick={() => setCoachContext(x => ({ ...x, deload: !x.deload }))}>DELOAD</button>
+            <button type="button" style={S.chipBtn(coachContext.race)} onClick={() => setCoachContext(x => ({ ...x, race: !x.race }))}>RACE WK</button>
+          </div>
+        </div>
+
         <div style={S.contextHint}>Autosaves with your log. Run the INSIGHT tab after training for AI analysis.</div>
       </div>
 
