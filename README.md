@@ -47,6 +47,14 @@ Session form fields (running load, sleep hours, perceived sleep, deload/race fla
 
 `supabase/migrations/002_coach_context.sql`
 
+### `today_log` unique (one row per user per day)
+
+Upserts use `ON CONFLICT (user_id, log_date)`. If save fails with *“no unique or exclusion constraint matching the ON CONFLICT specification”*, apply:
+
+`supabase/migrations/003_today_log_unique.sql`
+
+The same error on **`workout_sessions`** means **`001_workout_sessions_phase.sql`** has not been applied yet.
+
 ## Local development
 
 ```bash
