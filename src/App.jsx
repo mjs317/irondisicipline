@@ -1,0 +1,1015 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react'
+import { supabase, USER_ID } from './supabase'
+
+// ─── Colors ───
+const BG      = '#0a0a0a'
+const CARD    = '#111111'
+const BORDER  = '#222222'
+const ACCENT  = '#D97706'
+const BLUE    = '#3B82F6'
+const GREEN   = '#22c55e'
+const PURPLE  = '#7C3AED'
+const RED     = '#DC2626'
+const TEXT    = '#e5e5e5'
+const MUTED   = '#555555'
+
+const FONT = "'Courier New', Courier, monospace"
+
+// ─── Helpers ───
+const today = () => {
+  const d = new Date()
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0')
+}
+
+const fmtDate = () => {
+  const d = new Date()
+  const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+  return `${days[d.getDay()]}, ${months[d.getMonth()]} ${d.getDate()}`
+}
+
+const colorForType = (t) => {
+  if (t === 'straight') return ACCENT
+  if (t === 'circuit' || t === 'superset') return PURPLE
+  if (t === 'core') return GREEN
+  if (t === 'metcon') return RED
+  return ACCENT
+}
+
+// ─── PROGRAM DATA ───
+
+const HYPERTROPHY = [
+  // DAY 1
+  {
+    name: 'Upper Horizontal',
+    tag: 'BENCH · ROWS · PUSH/PULL',
+    note: null,
+    circuits: [
+      {
+        id: 'd1_s1', label: 'STRAIGHT SETS', type: 'straight', sets: 4, rest: '2:00 b/t sets',
+        coachNote: 'RPE 8–9. Pick a weight you can control for all 10. 3-sec descent every rep. Volume is the goal this phase.',
+        exercises: [{ id: 'bench_press', name: 'Bench Press', target: '8–10', score: true }]
+      },
+      {
+        id: 'd1_c1', label: 'CIRCUIT', type: 'circuit', sets: 4, rest: '1:30 b/t rounds',
+        coachNote: 'RPE 9. Row to your belly button — not your shoulder. Keep :10 between exercises to accumulate the pump.',
+        exercises: [
+          { id: 'db_bent_row', name: 'DB Bent Over Row', target: '10–12' },
+          { id: 'db_bench', name: 'DB Bench Press', target: '10–12' }
+        ]
+      },
+      {
+        id: 'd1_c2', label: 'CIRCUIT', type: 'circuit', sets: 3, rest: '1:30 b/t rounds',
+        coachNote: 'RPE 9. Max reps dips — add weight if bodyweight is easy for 6+. Row immediately after to balance the push.',
+        exercises: [
+          { id: 'bar_dips', name: 'Bar Dips add weight if easy', target: 'Max min 6' },
+          { id: 'cable_row', name: 'Cable or Band Row', target: '12–16' }
+        ]
+      },
+      {
+        id: 'd1_core', label: 'CORE FINISHER — CIRCUIT', type: 'core', sets: 3, rest: '1:00 b/t rounds',
+        coachNote: 'RPE 8. Lower back FLAT on dead bugs. Hollow hold: squeeze glutes and abs simultaneously.',
+        exercises: [
+          { id: 'd1_hollow', name: 'Hollow Body Hold', target: '0:45' },
+          { id: 'd1_deadbug', name: 'Slow Dead Bugs', target: '20 reps' },
+          { id: 'd1_plank', name: 'Plank Hold', target: '1:00' }
+        ]
+      }
+    ]
+  },
+  // DAY 2
+  {
+    name: 'Lower Hinge + Glutes',
+    tag: 'RDL · GLUTES · HINGE',
+    note: 'Glute and hinge dominant. Minimal quad stress so your runs stay intact.',
+    circuits: [
+      {
+        id: 'd2_s1', label: 'STRAIGHT SETS', type: 'straight', sets: 4, rest: '2:00 b/t sets',
+        coachNote: 'RPE 8–9. Feel the hamstring stretch at the bottom. Use straps so grip is not the limiter.',
+        exercises: [{ id: 'rdl', name: 'Romanian Deadlift', target: '10–12', score: true }]
+      },
+      {
+        id: 'd2_c1', label: 'CIRCUIT', type: 'circuit', sets: 3, rest: '1:30 b/t rounds',
+        coachNote: 'RPE 9. Single leg RDL: slow and controlled. Glute bridge: squeeze and hold one beat at the top.',
+        exercises: [
+          { id: 'sl_rdl', name: 'Single Leg RDL', target: '10/side' },
+          { id: 'glute_bridge', name: 'KB or DB Glute Bridge', target: '15–20' }
+        ]
+      },
+      {
+        id: 'd2_c2', label: 'CIRCUIT', type: 'circuit', sets: 3, rest: '1:30 b/t rounds',
+        coachNote: 'RPE 9. Forward lean on lunges loads the glute over the quad. 3-sec descent on hamstring curl.',
+        exercises: [
+          { id: 'db_lunge', name: 'DB Walking Lunges slight forward lean', target: '16–20 steps' },
+          { id: 'ham_curl', name: 'Hamstring Curl Rower or Machine 30X0', target: '12–15' }
+        ]
+      },
+      {
+        id: 'd2_core', label: 'CORE FINISHER — CIRCUIT', type: 'core', sets: 3, rest: '1:00 b/t rounds',
+        coachNote: 'RPE 8. Straight legs on raises — kipping defeats the purpose. Ab wheel: only go as far as your lower back stays flat.',
+        exercises: [
+          { id: 'd2_hang_raise', name: 'Hanging Leg Raises straight legs', target: '10–15' },
+          { id: 'd2_rev_crunch', name: 'Reverse Crunch', target: '15–20' },
+          { id: 'd2_ab_wheel', name: 'Ab Wheel Rollout', target: '10–12' }
+        ]
+      }
+    ]
+  },
+  // DAY 3
+  {
+    name: 'Upper Vertical + Arms',
+    tag: 'PULL-UPS · PRESS · ARMS',
+    note: null,
+    circuits: [
+      {
+        id: 'd3_s1', label: 'SUPERSET — alternate exercises each set, then rest', type: 'superset', sets: 4, rest: '1:00 b/t exercises · 2:00 b/t rounds',
+        coachNote: 'RPE 9. Aim for 8–10 clean pull-ups. Add weight if bodyweight is easy for 10. Press should be equally hard.',
+        exercises: [
+          { id: 'weighted_pullup', name: 'Weighted Pull-Ups', target: '8–10', score: true },
+          { id: 'strict_press', name: 'Strict Press', target: '8–10', score: true }
+        ]
+      },
+      {
+        id: 'd3_c1', label: 'CIRCUIT', type: 'circuit', sets: 3, rest: '1:30 b/t rounds',
+        coachNote: 'RPE 9. Arnold press hits the full delt. Lead elbows on laterals — not hands. Face pulls are not optional.',
+        exercises: [
+          { id: 'arnold_press', name: 'Arnold Press', target: '10–12' },
+          { id: 'lateral_raise', name: 'DB Lateral Raises', target: '12–16' },
+          { id: 'band_pull_apart', name: 'Band Pull-Aparts or Face Pulls', target: '15–20' }
+        ]
+      },
+      {
+        id: 'd3_c2', label: 'CIRCUIT', type: 'circuit', sets: 3, rest: '1:30 b/t rounds',
+        coachNote: 'RPE 9. High reps for the pump. Squeeze at the top of every curl. Full extension on skull crushers.',
+        exercises: [
+          { id: 'barbell_curl', name: 'Barbell or DB Curl', target: '12–15' },
+          { id: 'skull_crusher', name: 'DB Skull Crushers', target: '12–15' }
+        ]
+      },
+      {
+        id: 'd3_core', label: 'CORE FINISHER — CIRCUIT', type: 'core', sets: 3, rest: '1:00 b/t rounds',
+        coachNote: 'RPE 8. Toes all the way to the bar — full range only. Add a plate on your back for the plank if it feels easy.',
+        exercises: [
+          { id: 'd3_ttb', name: 'Strict Toes to Bar', target: '10–15' },
+          { id: 'd3_weight_sit_up', name: 'Weighted Sit-Up plate at chest', target: '15–20' },
+          { id: 'd3_plank', name: 'Weighted Plank plate on back', target: '0:45' }
+        ]
+      }
+    ]
+  },
+  // DAY 4
+  {
+    name: 'Full Body Power',
+    tag: 'SQUAT · POWER · CONDITIONING',
+    note: 'Moderate squat load — runs take priority. Power complex is explosive. Full send on the finisher.',
+    circuits: [
+      {
+        id: 'd4_s1', label: 'STRAIGHT SETS', type: 'straight', sets: 4, rest: '2:00 b/t sets',
+        coachNote: 'RPE 8. Controlled descent, drive through the whole foot. Moderate load — protecting the legs for run week.',
+        exercises: [{ id: 'front_squat', name: 'Front Squat or Back Squat', target: '8–10', score: true }]
+      },
+      {
+        id: 'd4_c1', label: 'CIRCUIT', type: 'circuit', sets: 3, rest: '2:00 b/t rounds',
+        coachNote: 'RPE 9. KB swings = hip drive, not arm lift. Push press: dip and drive. Box jumps: land soft, step down, reset.',
+        exercises: [
+          { id: 'kb_swing', name: 'Heavy KB Swings', target: '12' },
+          { id: 'db_push_press', name: 'DB Push Press', target: '10–12' },
+          { id: 'box_jump', name: 'Box Jumps step down', target: '8' }
+        ]
+      },
+      {
+        id: 'd4_metcon', label: 'CONDITIONING FINISHER — tap your option', type: 'metcon', sets: 1, rest: 'as programmed', isMetcon: true,
+        coachNote: 'Rotate A → B → C each week. All sub-15 minutes. Tap the one you completed.',
+        exercises: [
+          { id: 'metcon_a', name: 'Option A', desc: '5 rounds: 10 Pull-ups + 10 Dips + :30 rest' },
+          { id: 'metcon_b', name: 'Option B', desc: 'EMOM 10 min: Even = 12 KB Swings · Odd = 8 Push Press' },
+          { id: 'metcon_c', name: 'Option C', desc: '3 rounds: 10 Pushups + 10 Inverted Rows + 10 Air Squats + :60 rest' }
+        ]
+      },
+      {
+        id: 'd4_core', label: 'CORE FINISHER — CIRCUIT', type: 'core', sets: 3, rest: '1:00 b/t rounds',
+        coachNote: 'RPE 8. V-ups: reach toes, not shins. Hollow hold: lower back glued to the floor.',
+        exercises: [
+          { id: 'd4_vup', name: 'V-Ups', target: '15–20' },
+          { id: 'd4_hollow', name: 'Hollow Body Hold', target: '0:45' },
+          { id: 'd4_side_plank', name: 'Side Plank Hold each side', target: '0:45/side' }
+        ]
+      }
+    ]
+  }
+]
+
+const STRENGTH = [
+  // DAY 1
+  {
+    name: 'Upper Horizontal',
+    tag: 'BENCH · ROWS · HEAVY PUSH/PULL',
+    note: 'Strength phase — fewer reps, heavier weight, longer rest. Build on your hypertrophy base.',
+    circuits: [
+      {
+        id: 'd1_s1', label: 'STRAIGHT SETS — 5x5', type: 'straight', sets: 5, rest: '3:00 b/t sets',
+        coachNote: 'RPE 9. True 5x5 — same heavy weight across all 5 sets. Complete all 5 clean? Add 5lb next session.',
+        exercises: [{ id: 'bench_press', name: 'Bench Press', target: '5', score: true }]
+      },
+      {
+        id: 'd1_c1', label: 'STRAIGHT SETS — heavy', type: 'straight', sets: 4, rest: '2:00 b/t sets',
+        coachNote: 'RPE 9. Weighted dips — add as much weight as you can handle for 6 clean, full-ROM reps.',
+        exercises: [{ id: 'bar_dips', name: 'Weighted Bar Dips heavy', target: '5–6', score: true }]
+      },
+      {
+        id: 'd1_c2', label: 'SUPERSET — alternate exercises each set, then rest', type: 'superset', sets: 4, rest: '1:00 b/t exercises · 2:00 b/t rounds',
+        coachNote: 'RPE 9. Heavy barbell row — brace core and row to your hip. Keep the incline press controlled.',
+        exercises: [
+          { id: 'bb_bent_row', name: 'Barbell Bent Over Row', target: '5–6', score: true },
+          { id: 'incline_db_press', name: 'Incline DB Press', target: '6–8' }
+        ]
+      },
+      {
+        id: 'd1_core', label: 'CORE FINISHER — CIRCUIT', type: 'core', sets: 3, rest: '1:00 b/t rounds',
+        coachNote: 'RPE 8. Plank with a plate on your back. Dead bugs: slow, deliberate, lower back flat the whole time.',
+        exercises: [
+          { id: 'd1_hollow', name: 'Hollow Body Hold', target: '1:00' },
+          { id: 'd1_deadbug', name: 'Slow Dead Bugs', target: '20 reps' },
+          { id: 'd1_plank', name: 'Weighted Plank plate on back', target: '1:00' }
+        ]
+      }
+    ]
+  },
+  // DAY 2
+  {
+    name: 'Lower Hinge + Glutes',
+    tag: 'DEADLIFT · GLUTES · HEAVY HINGE',
+    note: 'Strength phase — conventional deadlift replaces RDL as the anchor. Still glute-dominant.',
+    circuits: [
+      {
+        id: 'd2_s1', label: 'STRAIGHT SETS — heavy', type: 'straight', sets: 4, rest: '3:00 b/t sets',
+        coachNote: 'RPE 9. Big breath, full brace, pull. Control the descent every rep. Real posterior chain strength.',
+        exercises: [{ id: 'deadlift', name: 'Conventional Deadlift', target: '3–5', score: true }]
+      },
+      {
+        id: 'd2_c1', label: 'STRAIGHT SETS — heavy', type: 'straight', sets: 4, rest: '2:00 b/t sets',
+        coachNote: 'RPE 9. Drive through the heel, squeeze at the top, hold one second. The glute king.',
+        exercises: [{ id: 'hip_thrust', name: 'Barbell or DB Hip Thrust', target: '6–8', score: true }]
+      },
+      {
+        id: 'd2_c2', label: 'SUPERSET — alternate exercises each set, then rest', type: 'superset', sets: 3, rest: '1:00 b/t exercises · 2:00 b/t rounds',
+        coachNote: 'RPE 9. Split stance RDL loads one leg without the balance challenge. Heavy ham curl — 3-sec descent.',
+        exercises: [
+          { id: 'sl_rdl', name: 'Split Stance DB RDL heavy', target: '6–8/side' },
+          { id: 'ham_curl', name: 'Hamstring Curl Rower or Machine 30X0', target: '8–10' }
+        ]
+      },
+      {
+        id: 'd2_core', label: 'CORE FINISHER — CIRCUIT', type: 'core', sets: 3, rest: '1:00 b/t rounds',
+        coachNote: 'RPE 8. Add load everywhere possible. Ab wheel: full extension only if lower back stays flat.',
+        exercises: [
+          { id: 'd2_hang_raise', name: 'Hanging Leg Raises straight legs', target: '12–15' },
+          { id: 'd2_rev_crunch', name: 'Weighted Reverse Crunch hold plate', target: '12–15' },
+          { id: 'd2_ab_wheel', name: 'Ab Wheel Rollout full extension', target: '8–10' }
+        ]
+      }
+    ]
+  },
+  // DAY 3
+  {
+    name: 'Upper Vertical + Arms',
+    tag: 'PULL-UPS · PRESS · HEAVY ARMS',
+    note: 'Strength phase — heavier weights, fewer reps. Build vertical pressing and pulling strength.',
+    circuits: [
+      {
+        id: 'd3_s1', label: 'SUPERSET — 5x5, alternate each set, then rest', type: 'superset', sets: 5, rest: '1:30 b/t exercises · 3:00 b/t rounds',
+        coachNote: 'RPE 9. Heavy pull + heavy press. Add weight to pull-ups. Same load across all 5 sets. No failed reps.',
+        exercises: [
+          { id: 'weighted_pullup', name: 'Weighted Pull-Ups heavy', target: '4–6', score: true },
+          { id: 'strict_press', name: 'Strict Press heavy', target: '4–6', score: true }
+        ]
+      },
+      {
+        id: 'd3_c1', label: 'STRAIGHT SETS — heavy', type: 'straight', sets: 4, rest: '2:00 b/t sets',
+        coachNote: 'RPE 9. Half-kneeling removes your ability to compensate with your lower body. Own the press.',
+        exercises: [{ id: 'hk_press', name: 'Half-Kneeling Single Arm DB Press', target: '6–8/side', score: true }]
+      },
+      {
+        id: 'd3_c2', label: 'CIRCUIT', type: 'circuit', sets: 3, rest: '1:30 b/t rounds',
+        coachNote: 'RPE 9. Heavy enough on laterals that last 2–3 reps need a little cheat. Face pulls protect your shoulders.',
+        exercises: [
+          { id: 'lateral_raise', name: 'DB Lateral Raises', target: '10–12' },
+          { id: 'band_pull_apart', name: 'Band Pull-Aparts or Face Pulls', target: '15–20' }
+        ]
+      },
+      {
+        id: 'd3_c3', label: 'SUPERSET — heavy arms', type: 'superset', sets: 3, rest: '1:00 b/t exercises · 1:30 b/t rounds',
+        coachNote: 'RPE 9. Heavier curl — fewer reps, more load. Full extension on skull crushers every rep.',
+        exercises: [
+          { id: 'barbell_curl', name: 'Barbell Curl heavy', target: '6–8' },
+          { id: 'skull_crusher', name: 'DB Skull Crushers heavy', target: '6–8' }
+        ]
+      },
+      {
+        id: 'd3_core', label: 'CORE FINISHER — CIRCUIT', type: 'core', sets: 3, rest: '1:00 b/t rounds',
+        coachNote: 'RPE 8. Heavier plate on sit-ups. Plank: full tension head to heel for the full minute.',
+        exercises: [
+          { id: 'd3_ttb', name: 'Strict Toes to Bar', target: '12–15' },
+          { id: 'd3_weight_sit_up', name: 'Weighted Sit-Up heavy plate', target: '12–15' },
+          { id: 'd3_plank', name: 'Weighted Plank heavy plate', target: '1:00' }
+        ]
+      }
+    ]
+  },
+  // DAY 4
+  {
+    name: 'Full Body Power',
+    tag: 'SQUAT · POWER · HEAVY CONDITIONING',
+    note: 'Strength phase — heavier squat and power complex. Still controlled — no wrecking legs before run week.',
+    circuits: [
+      {
+        id: 'd4_s1', label: 'STRAIGHT SETS — heavy', type: 'straight', sets: 4, rest: '3:00 b/t sets',
+        coachNote: 'RPE 9. Fewer reps, more load. No bouncing out of the hole. Controlled descent, drive hard out of the bottom.',
+        exercises: [{ id: 'front_squat', name: 'Front Squat or Back Squat', target: '4–6', score: true }]
+      },
+      {
+        id: 'd4_c1', label: 'CIRCUIT', type: 'circuit', sets: 4, rest: '2:00 b/t rounds',
+        coachNote: 'RPE 9. Heavier KB swings — max hip snap. Heavier push press. Box jumps: focus on height and power.',
+        exercises: [
+          { id: 'kb_swing', name: 'Heavy KB Swings', target: '8–10' },
+          { id: 'db_push_press', name: 'DB Push Press heavy', target: '6–8' },
+          { id: 'box_jump', name: 'Box Jumps max height', target: '5–6' }
+        ]
+      },
+      {
+        id: 'd4_metcon', label: 'CONDITIONING FINISHER — tap your option', type: 'metcon', sets: 1, rest: 'as programmed', isMetcon: true,
+        coachNote: 'Strength phase finishers — same formats, heavier loads. Tap the one you completed.',
+        exercises: [
+          { id: 'metcon_a', name: 'Option A', desc: '5 rounds: 8 Weighted Pull-ups + 8 Weighted Dips + :45 rest' },
+          { id: 'metcon_b', name: 'Option B', desc: 'EMOM 12 min: Even = 10 Heavy KB Swings · Odd = 6 Heavy Push Press' },
+          { id: 'metcon_c', name: 'Option C', desc: '4 rounds: 8 Strict Pull-ups + 10 Ring Rows + 10 Pushups + :60 rest' }
+        ]
+      },
+      {
+        id: 'd4_core', label: 'CORE FINISHER — CIRCUIT', type: 'core', sets: 3, rest: '1:00 b/t rounds',
+        coachNote: 'RPE 8. Add load everywhere. Side plank: weight plate on your hip. Make it harder than hypertrophy phase.',
+        exercises: [
+          { id: 'd4_vup', name: 'Weighted V-Ups plate at chest', target: '12–15' },
+          { id: 'd4_hollow', name: 'Hollow Body Hold', target: '1:00' },
+          { id: 'd4_side_plank', name: 'Weighted Side Plank each side', target: '0:45/side' }
+        ]
+      }
+    ]
+  }
+]
+
+const PHASES = { hypertrophy: HYPERTROPHY, strength: STRENGTH }
+
+// ─── APP ───
+
+export default function App() {
+  const [loaded, setLoaded] = useState(false)
+  const [tab, setTab] = useState('workout')
+  const [phase, setPhase] = useState('hypertrophy')
+  const [activeDay, setActiveDay] = useState(0)
+  const [sets, setSets] = useState({})
+  const [metconSel, setMetconSel] = useState({})
+  const [prs, setPrs] = useState({})
+  const [history, setHistory] = useState([])
+  const [aiResponse, setAiResponse] = useState('')
+  const [aiLoading, setAiLoading] = useState(false)
+  const [saveMsg, setSaveMsg] = useState('')
+  const [noteOpen, setNoteOpen] = useState({})
+  const autoSaveTimer = useRef(null)
+
+  const days = PHASES[phase]
+  const dayData = days[activeDay]
+
+  // ─── Load data on mount ───
+  useEffect(() => {
+    ;(async () => {
+      try {
+        const [prRes, histRes, todayRes] = await Promise.all([
+          supabase.from('personal_records').select('exercise_id, weight, recorded_date').eq('user_id', USER_ID),
+          supabase.from('workout_sessions').select('*').eq('user_id', USER_ID).order('session_date', { ascending: false }).limit(100),
+          supabase.from('today_log').select('sets_data, metcon_sel').eq('user_id', USER_ID).eq('log_date', today()).maybeSingle()
+        ])
+        if (prRes.data) {
+          const p = {}
+          prRes.data.forEach(r => { p[r.exercise_id] = { weight: Number(r.weight), date: r.recorded_date } })
+          setPrs(p)
+        }
+        if (histRes.data) setHistory(histRes.data)
+        if (todayRes.data) {
+          if (todayRes.data.sets_data) setSets(todayRes.data.sets_data)
+          if (todayRes.data.metcon_sel) setMetconSel(todayRes.data.metcon_sel)
+        }
+      } catch (e) {
+        console.error('Load error:', e)
+      }
+      setLoaded(true)
+    })()
+  }, [])
+
+  // ─── Auto-save today log on changes ───
+  useEffect(() => {
+    if (!loaded) return
+    if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
+    autoSaveTimer.current = setTimeout(async () => {
+      try {
+        await supabase.from('today_log').upsert({
+          user_id: USER_ID,
+          log_date: today(),
+          sets_data: sets,
+          metcon_sel: metconSel,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'user_id,log_date' })
+      } catch (e) { console.error('Auto-save error:', e) }
+    }, 2000)
+    return () => { if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current) }
+  }, [sets, metconSel, loaded])
+
+  // ─── Set row updates ───
+  const updateSet = useCallback((circuitId, exId, idx, field, val, totalSets) => {
+    const key = circuitId + '__' + exId
+    setSets(prev => {
+      const base = Array.from({ length: totalSets }, (_, i) =>
+        (prev[key] && prev[key][i]) ? { ...prev[key][i] } : { weight: '', reps: '', done: false }
+      )
+      base[idx] = { ...base[idx], [field]: val }
+      return { ...prev, [key]: base }
+    })
+  }, [])
+
+  const toggleDone = useCallback((circuitId, exId, idx, totalSets) => {
+    const key = circuitId + '__' + exId
+    setSets(prev => {
+      const base = Array.from({ length: totalSets }, (_, i) =>
+        (prev[key] && prev[key][i]) ? { ...prev[key][i] } : { weight: '', reps: '', done: false }
+      )
+      base[idx] = { ...base[idx], done: !base[idx].done }
+      return { ...prev, [key]: base }
+    })
+  }, [])
+
+  const toggleMetcon = useCallback((circuitId, exId) => {
+    setMetconSel(prev => ({
+      ...prev,
+      [circuitId]: prev[circuitId] === exId ? null : exId
+    }))
+  }, [])
+
+  // ─── Save workout ───
+  const saveWorkout = async () => {
+    setSaveMsg('SAVING...')
+    try {
+      const prUpserts = []
+      for (const circuit of dayData.circuits) {
+        if (circuit.isMetcon) continue
+        for (const ex of circuit.exercises) {
+          if (!ex.score) continue
+          const key = circuit.id + '__' + ex.id
+          const rows = sets[key] || []
+          let maxW = 0
+          rows.forEach(r => { if (r.done && r.weight && Number(r.weight) > maxW) maxW = Number(r.weight) })
+          if (maxW > 0 && (!prs[ex.id] || maxW > prs[ex.id].weight)) {
+            prUpserts.push({ user_id: USER_ID, exercise_id: ex.id, weight: maxW, recorded_date: today() })
+          }
+        }
+      }
+      if (prUpserts.length > 0) {
+        await supabase.from('personal_records').upsert(prUpserts, { onConflict: 'user_id,exercise_id' })
+        const newPrs = { ...prs }
+        prUpserts.forEach(u => { newPrs[u.exercise_id] = { weight: u.weight, date: u.recorded_date } })
+        setPrs(newPrs)
+      }
+
+      await supabase.from('workout_sessions').upsert({
+        user_id: USER_ID,
+        session_date: today(),
+        day_idx: activeDay,
+        day_name: dayData.name,
+        phase,
+        sets_data: sets,
+        metcon_sel: metconSel
+      }, { onConflict: 'user_id,session_date,day_idx' })
+
+      await supabase.from('today_log').upsert({
+        user_id: USER_ID,
+        log_date: today(),
+        sets_data: sets,
+        metcon_sel: metconSel,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'user_id,log_date' })
+
+      const { data: freshHist } = await supabase.from('workout_sessions').select('*').eq('user_id', USER_ID).order('session_date', { ascending: false }).limit(100)
+      if (freshHist) setHistory(freshHist)
+
+      setSaveMsg('✓ SAVED')
+      setTimeout(() => setSaveMsg(''), 2000)
+    } catch (e) {
+      console.error('Save error:', e)
+      setSaveMsg('ERR: ' + e.message)
+      setTimeout(() => setSaveMsg(''), 3000)
+    }
+  }
+
+  // ─── AI Coaching ───
+  const getCoaching = async () => {
+    setAiLoading(true)
+    setAiResponse('')
+    try {
+      const exerciseLines = []
+      for (const circuit of dayData.circuits) {
+        if (circuit.isMetcon) continue
+        for (const ex of circuit.exercises) {
+          const key = circuit.id + '__' + ex.id
+          const rows = sets[key] || []
+          const logged = rows.filter(r => r.weight || r.reps).map((r, i) => `Set ${i+1}: ${r.weight || '?'}lb x ${r.reps || '?'} ${r.done ? '(done)' : ''}`).join(', ')
+          const pr = prs[ex.id] ? `PR: ${prs[ex.id].weight}lb (${prs[ex.id].date})` : 'No PR yet'
+          exerciseLines.push(`${ex.name} [target: ${ex.target}] — ${logged || 'no sets logged'} — ${pr}`)
+        }
+      }
+
+      const sameDayHist = history.filter(h => h.day_idx === activeDay && h.phase === phase).slice(0, 3)
+      let histBlock = 'No previous sessions for this day.'
+      if (sameDayHist.length > 0) {
+        histBlock = sameDayHist.map(h => {
+          const d = h.sets_data || {}
+          const lines = Object.entries(d).map(([k, v]) => {
+            const best = Math.max(0, ...v.filter(s => s.done).map(s => Number(s.weight) || 0))
+            return `  ${k}: best ${best}lb`
+          }).join('\n')
+          return `Session ${h.session_date}:\n${lines}`
+        }).join('\n\n')
+      }
+
+      const prompt = `You are a strength coach reviewing a workout session. Be direct and specific.
+
+TODAY'S WORKOUT — ${phase.toUpperCase()} PHASE — Day ${activeDay + 1}: ${dayData.name}
+
+Exercises logged today:
+${exerciseLines.join('\n')}
+
+Last 3 sessions of this same day:
+${histBlock}
+
+Respond with bullet points:
+• Weight recommendation for each exercise (up/down/hold)
+• Flag any rep drops greater than 20% from previous sessions
+• Note any PRs hit today
+• One-sentence session grade (A/B/C/D)
+• One specific goal for next session`
+
+      const res = await fetch('/api/coach', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt })
+      })
+      const data = await res.json()
+      if (data.content && data.content[0]) {
+        setAiResponse(data.content[0].text)
+      } else if (data.error) {
+        setAiResponse('Error: ' + (data.error.message || JSON.stringify(data.error)))
+      } else {
+        setAiResponse(JSON.stringify(data, null, 2))
+      }
+    } catch (e) {
+      setAiResponse('Error: ' + e.message)
+    }
+    setAiLoading(false)
+  }
+
+  // ─── Done counting ───
+  const circuitDoneCount = (circuit) => {
+    if (circuit.isMetcon) return metconSel[circuit.id] ? 1 : 0
+    let done = 0, total = 0
+    for (const ex of circuit.exercises) {
+      const key = circuit.id + '__' + ex.id
+      const rows = sets[key] || []
+      for (let i = 0; i < circuit.sets; i++) {
+        total++
+        if (rows[i] && rows[i].done) done++
+      }
+    }
+    return { done, total }
+  }
+
+  // ─── Gather all exercises from both phases for PRs tab ───
+  const allExercisesByDay = () => {
+    const result = [[], [], [], []]
+    const seen = new Set()
+    for (const phaseKey of ['hypertrophy', 'strength']) {
+      const phaseDays = PHASES[phaseKey]
+      phaseDays.forEach((day, dayIdx) => {
+        day.circuits.forEach(circuit => {
+          if (circuit.isMetcon) return
+          circuit.exercises.forEach(ex => {
+            if (!seen.has(ex.id) && prs[ex.id]) {
+              seen.add(ex.id)
+              result[dayIdx].push(ex)
+            }
+          })
+        })
+      })
+    }
+    return result
+  }
+
+  // ─── STYLES ───
+  const S = {
+    app: { fontFamily: FONT, background: BG, color: TEXT, minHeight: '100vh', maxWidth: 600, margin: '0 auto', padding: '0 12px 80px', WebkitFontSmoothing: 'antialiased' },
+    header: { padding: '16px 0 8px' },
+    titleRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' },
+    titleLeft: {},
+    h1: { fontSize: 16, fontWeight: 700, letterSpacing: 2, color: ACCENT, margin: 0 },
+    h2: { fontSize: 10, fontWeight: 400, letterSpacing: 3, color: MUTED, margin: '2px 0 0' },
+    dateText: { fontSize: 10, color: MUTED, textAlign: 'right' },
+    phaseText: { fontSize: 10, color: ACCENT, textAlign: 'right', marginTop: 2 },
+    phaseToggle: { display: 'flex', gap: 6, margin: '10px 0 6px' },
+    phaseBtn: (active) => ({
+      flex: 1, padding: '8px 4px', border: 'none', borderRadius: 4, cursor: 'pointer', fontFamily: FONT,
+      fontSize: 10, fontWeight: 700, letterSpacing: 1, textTransform: 'uppercase',
+      background: active ? ACCENT : '#1a1a1a', color: active ? '#000' : MUTED
+    }),
+    tabs: { display: 'flex', gap: 0, borderBottom: `1px solid ${BORDER}`, marginBottom: 12 },
+    tab: (active) => ({
+      flex: 1, padding: '10px 0', border: 'none', borderBottom: active ? `2px solid ${ACCENT}` : '2px solid transparent',
+      background: 'transparent', color: active ? ACCENT : MUTED, fontFamily: FONT, fontSize: 11,
+      fontWeight: 700, letterSpacing: 2, cursor: 'pointer', textAlign: 'center'
+    }),
+    daySelector: { display: 'flex', gap: 6, margin: '8px 0 12px' },
+    dayBtn: (active) => ({
+      flex: 1, padding: '8px 0', border: 'none', borderRadius: 4, cursor: 'pointer', fontFamily: FONT,
+      background: active ? ACCENT : '#1a1a1a', color: active ? '#000' : MUTED, textAlign: 'center'
+    }),
+    dayBtnSm: { fontSize: 8, letterSpacing: 1, display: 'block', marginBottom: 2 },
+    dayBtnLg: { fontSize: 20, fontWeight: 700, display: 'block' },
+    dayHeader: { marginBottom: 12 },
+    dayNum: { fontSize: 10, color: MUTED, letterSpacing: 2 },
+    dayTag: { fontSize: 10, color: ACCENT, letterSpacing: 1, marginTop: 2 },
+    dayName: { fontSize: 18, fontWeight: 700, marginTop: 4 },
+    dayNote: { fontSize: 11, color: MUTED, marginTop: 6, paddingLeft: 10, borderLeft: `2px solid ${ACCENT}`, lineHeight: 1.4 },
+    legend: { display: 'flex', gap: 12, marginBottom: 14, flexWrap: 'wrap' },
+    legendItem: { display: 'flex', alignItems: 'center', gap: 4 },
+    legendSwatch: (c) => ({ width: 10, height: 10, borderRadius: 2, background: c }),
+    legendLabel: { fontSize: 9, color: MUTED, letterSpacing: 1 },
+    circuitCard: (c) => ({
+      background: CARD, border: `2px solid ${c}`, borderRadius: 6, marginBottom: 12, overflow: 'hidden'
+    }),
+    circuitHeader: (c) => ({
+      padding: '8px 10px', background: c + '18', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 4
+    }),
+    circuitLabel: (c) => ({ fontSize: 10, fontWeight: 700, color: c, letterSpacing: 1 }),
+    circuitMeta: { fontSize: 9, color: MUTED, marginTop: 2 },
+    circuitDone: (complete) => ({
+      fontSize: 10, fontWeight: 700, color: complete ? GREEN : MUTED, minWidth: 40, textAlign: 'right'
+    }),
+    goalBtn: (c) => ({
+      fontSize: 9, padding: '2px 8px', border: `1px solid ${c}`, borderRadius: 3, background: 'transparent',
+      color: c, cursor: 'pointer', fontFamily: FONT, fontWeight: 700, letterSpacing: 1, marginLeft: 6
+    }),
+    coachNote: (c) => ({
+      padding: '8px 10px', fontSize: 11, color: TEXT, background: c + '10', borderTop: `1px solid ${c}30`,
+      lineHeight: 1.5
+    }),
+    exerciseBlock: { padding: '10px 10px 6px' },
+    exerciseHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
+    exerciseName: { fontSize: 13, fontWeight: 700 },
+    exerciseTarget: { fontSize: 9, color: MUTED, marginTop: 1 },
+    prBadge: { fontSize: 9, fontWeight: 700, color: ACCENT, background: ACCENT + '20', padding: '2px 6px', borderRadius: 3 },
+    colHeaders: { display: 'grid', gridTemplateColumns: '30px 1fr 1fr 36px', gap: 4, marginBottom: 4, padding: '0 2px' },
+    colHeader: { fontSize: 8, color: MUTED, letterSpacing: 1, textAlign: 'center' },
+    setRow: { display: 'grid', gridTemplateColumns: '30px 1fr 1fr 36px', gap: 4, marginBottom: 4, alignItems: 'center', padding: '0 2px' },
+    setNum: { fontSize: 11, color: MUTED, textAlign: 'center' },
+    setInput: (done) => ({
+      width: '100%', padding: '6px 4px', border: done ? `1px solid ${GREEN}50` : `1px solid ${BORDER}`,
+      borderRadius: 3, background: done ? GREEN + '15' : '#1a1a1a', color: TEXT, fontFamily: FONT,
+      fontSize: 14, fontWeight: 700, textAlign: 'center', outline: 'none'
+    }),
+    checkBtn: (done) => ({
+      width: 30, height: 30, border: done ? `2px solid ${GREEN}` : `2px solid ${BORDER}`, borderRadius: 4,
+      background: done ? GREEN : 'transparent', color: done ? '#000' : MUTED, cursor: 'pointer',
+      fontFamily: FONT, fontSize: 14, fontWeight: 700, display: 'flex', alignItems: 'center',
+      justifyContent: 'center', margin: '0 auto'
+    }),
+    divider: (c) => ({ height: 1, background: c + '40', margin: '8px 0' }),
+    metconCard: (selected) => ({
+      display: 'flex', alignItems: 'flex-start', gap: 10, padding: '10px 12px', margin: '6px 10px',
+      borderRadius: 6, cursor: 'pointer', border: selected ? `2px solid ${GREEN}` : `2px solid ${BORDER}`,
+      background: selected ? GREEN + '15' : '#1a1a1a', transition: 'all 0.15s ease'
+    }),
+    metconBadge: (selected) => ({
+      width: 28, height: 28, borderRadius: 4, background: selected ? GREEN : '#333',
+      color: selected ? '#000' : MUTED, display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontSize: 12, fontWeight: 700, fontFamily: FONT, flexShrink: 0
+    }),
+    metconText: { fontSize: 12, color: TEXT, lineHeight: 1.4 },
+    btnRow: { display: 'flex', gap: 8, margin: '16px 0' },
+    saveBtn: { flex: 1, padding: '14px', border: 'none', borderRadius: 6, background: ACCENT, color: '#000', fontFamily: FONT, fontSize: 13, fontWeight: 700, letterSpacing: 1, cursor: 'pointer' },
+    coachBtn: (loading) => ({
+      flex: 1, padding: '14px', border: `2px solid ${BLUE}`, borderRadius: 6,
+      background: BLUE + '15', color: BLUE, fontFamily: FONT, fontSize: 13, fontWeight: 700,
+      letterSpacing: 1, cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.6 : 1
+    }),
+    aiPanel: { background: BLUE + '12', border: `1px solid ${BLUE}40`, borderRadius: 6, padding: '12px', marginBottom: 16 },
+    aiLabel: { fontSize: 10, fontWeight: 700, color: BLUE, letterSpacing: 2, marginBottom: 8 },
+    aiText: { fontSize: 12, color: TEXT, whiteSpace: 'pre-wrap', lineHeight: 1.6 },
+    prSection: { marginBottom: 20 },
+    prSectionHeader: { fontSize: 12, fontWeight: 700, color: ACCENT, letterSpacing: 2, padding: '8px 0', borderBottom: `1px solid ${BORDER}`, marginBottom: 8 },
+    prRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0', borderBottom: `1px solid ${BORDER}10` },
+    prName: { fontSize: 12, color: TEXT },
+    prWeight: { fontSize: 16, fontWeight: 700, color: ACCENT },
+    prDate: { fontSize: 9, color: MUTED },
+    emptyText: { textAlign: 'center', color: MUTED, fontSize: 13, marginTop: 40 },
+    histCard: { background: CARD, border: `1px solid ${BORDER}`, borderRadius: 6, padding: '12px', marginBottom: 10, position: 'relative' },
+    histDay: { fontSize: 13, fontWeight: 700 },
+    histMeta: { fontSize: 10, color: MUTED, marginTop: 2 },
+    histMetcon: { position: 'absolute', top: 12, right: 12, fontSize: 9, fontWeight: 700, color: GREEN },
+    histExLine: { fontSize: 11, color: MUTED, marginTop: 4 },
+    loadingScreen: { display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', fontFamily: FONT, color: ACCENT, fontSize: 16, letterSpacing: 3, background: BG }
+  }
+
+  if (!loaded) {
+    return <div style={S.loadingScreen}>LOADING...</div>
+  }
+
+  // ─── RENDER: WORKOUT TAB ───
+  const renderWorkout = () => (
+    <>
+      {/* Day selector */}
+      <div style={S.daySelector}>
+        {days.map((d, i) => (
+          <button key={i} style={S.dayBtn(activeDay === i)} onClick={() => setActiveDay(i)}>
+            <span style={S.dayBtnSm}>DAY</span>
+            <span style={S.dayBtnLg}>{i + 1}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* Day header */}
+      <div style={S.dayHeader}>
+        <div style={S.dayNum}>DAY {activeDay + 1}</div>
+        <div style={S.dayTag}>{dayData.tag}</div>
+        <div style={S.dayName}>{dayData.name}</div>
+        {dayData.note && <div style={S.dayNote}>{dayData.note}</div>}
+      </div>
+
+      {/* Legend */}
+      <div style={S.legend}>
+        {[['Straight Sets', ACCENT], ['Circuit/Superset', PURPLE], ['Core', GREEN], ['Conditioning', RED]].map(([label, c]) => (
+          <div key={label} style={S.legendItem}>
+            <div style={S.legendSwatch(c)} />
+            <span style={S.legendLabel}>{label}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Circuit cards */}
+      {dayData.circuits.map(circuit => {
+        const c = colorForType(circuit.type)
+        const dc = circuitDoneCount(circuit)
+        const isComplete = circuit.isMetcon ? dc === 1 : (dc.done === dc.total && dc.total > 0)
+
+        return (
+          <div key={circuit.id} style={S.circuitCard(c)}>
+            {/* Circuit header */}
+            <div style={S.circuitHeader(c)}>
+              <div style={{ flex: 1 }}>
+                <div style={S.circuitLabel(c)}>{circuit.label.toUpperCase()}</div>
+                <div style={S.circuitMeta}>
+                  {circuit.isMetcon ? 'choose one · rest as programmed' : `${circuit.sets} sets · rest ${circuit.rest}`}
+                </div>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <button style={S.goalBtn(c)} onClick={() => setNoteOpen(p => ({ ...p, [circuit.id]: !p[circuit.id] }))}>
+                  GOAL
+                </button>
+                <div style={S.circuitDone(isComplete)}>
+                  {circuit.isMetcon
+                    ? (dc === 1 ? 'DONE ✓' : '—')
+                    : `${dc.done}/${dc.total}`
+                  }
+                </div>
+              </div>
+            </div>
+
+            {/* Coach note (toggleable) */}
+            {noteOpen[circuit.id] && (
+              <div style={S.coachNote(c)}>{circuit.coachNote}</div>
+            )}
+
+            {/* Metcon UI */}
+            {circuit.isMetcon ? (
+              <div style={{ padding: '6px 0' }}>
+                {circuit.exercises.map(ex => {
+                  const selected = metconSel[circuit.id] === ex.id
+                  return (
+                    <div key={ex.id} style={S.metconCard(selected)} onClick={() => toggleMetcon(circuit.id, ex.id)}>
+                      <div style={S.metconBadge(selected)}>
+                        {selected ? '✓' : ex.name.replace('Option ', '')}
+                      </div>
+                      <div style={S.metconText}>{ex.desc}</div>
+                    </div>
+                  )
+                })}
+              </div>
+            ) : (
+              /* Regular exercises */
+              <div>
+                {circuit.exercises.map((ex, exIdx) => {
+                  const key = circuit.id + '__' + ex.id
+                  const exSets = sets[key] || []
+
+                  return (
+                    <React.Fragment key={ex.id}>
+                      {exIdx > 0 && <div style={S.divider(c)} />}
+                      <div style={S.exerciseBlock}>
+                        <div style={S.exerciseHeader}>
+                          <div>
+                            <div style={S.exerciseName}>{ex.name}</div>
+                            <div style={S.exerciseTarget}>Target: {ex.target}</div>
+                          </div>
+                          {prs[ex.id] && (
+                            <div style={S.prBadge}>PR {prs[ex.id].weight}lb</div>
+                          )}
+                        </div>
+                        <div style={S.colHeaders}>
+                          <div style={S.colHeader}>SET</div>
+                          <div style={S.colHeader}>LBS</div>
+                          <div style={S.colHeader}>REPS</div>
+                          <div style={S.colHeader}>✓</div>
+                        </div>
+                        {Array.from({ length: circuit.sets }, (_, i) => {
+                          const row = exSets[i] || { weight: '', reps: '', done: false }
+                          return (
+                            <div key={i} style={S.setRow}>
+                              <div style={S.setNum}>{i + 1}</div>
+                              <input
+                                type="tel"
+                                inputMode="decimal"
+                                placeholder="—"
+                                value={row.weight}
+                                onChange={e => updateSet(circuit.id, ex.id, i, 'weight', e.target.value, circuit.sets)}
+                                style={S.setInput(row.done)}
+                              />
+                              <input
+                                type="tel"
+                                inputMode="decimal"
+                                placeholder="—"
+                                value={row.reps}
+                                onChange={e => updateSet(circuit.id, ex.id, i, 'reps', e.target.value, circuit.sets)}
+                                style={S.setInput(row.done)}
+                              />
+                              <button
+                                style={S.checkBtn(row.done)}
+                                onClick={() => toggleDone(circuit.id, ex.id, i, circuit.sets)}
+                              >
+                                {row.done ? '✓' : ''}
+                              </button>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </React.Fragment>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )
+      })}
+
+      {/* Save + Coach buttons */}
+      <div style={S.btnRow}>
+        <button style={S.saveBtn} onClick={saveWorkout}>
+          {saveMsg || 'SAVE WORKOUT'}
+        </button>
+        <button style={S.coachBtn(aiLoading)} onClick={getCoaching} disabled={aiLoading}>
+          {aiLoading ? 'ANALYZING...' : 'GET COACHING'}
+        </button>
+      </div>
+
+      {/* AI response */}
+      {aiResponse && (
+        <div style={S.aiPanel}>
+          <div style={S.aiLabel}>AI COACH</div>
+          <div style={S.aiText}>{aiResponse}</div>
+        </div>
+      )}
+    </>
+  )
+
+  // ─── RENDER: PRs TAB ───
+  const renderPRs = () => {
+    const byDay = allExercisesByDay()
+    const hasPrs = byDay.some(d => d.length > 0)
+
+    return (
+      <>
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, letterSpacing: 2 }}>ALL TIME / PERSONAL RECORDS</div>
+          <div style={{ fontSize: 10, color: MUTED, marginTop: 4 }}>Tracks both hypertrophy and strength phase lifts.</div>
+        </div>
+        {!hasPrs ? (
+          <div style={S.emptyText}>No PRs yet. Log and save workouts to track them.</div>
+        ) : (
+          byDay.map((exs, dayIdx) => exs.length > 0 && (
+            <div key={dayIdx} style={S.prSection}>
+              <div style={S.prSectionHeader}>DAY {dayIdx + 1} — {HYPERTROPHY[dayIdx].name.toUpperCase()}</div>
+              {exs.map(ex => (
+                <div key={ex.id} style={S.prRow}>
+                  <div style={S.prName}>{ex.name}</div>
+                  <div style={{ textAlign: 'right' }}>
+                    <div style={S.prWeight}>{prs[ex.id].weight}lb</div>
+                    <div style={S.prDate}>{prs[ex.id].date}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ))
+        )}
+      </>
+    )
+  }
+
+  // ─── RENDER: HISTORY TAB ───
+  const renderHistory = () => (
+    <>
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: 14, fontWeight: 700, letterSpacing: 2 }}>SESSION LOG / HISTORY</div>
+      </div>
+      {history.length === 0 ? (
+        <div style={S.emptyText}>No sessions saved yet.</div>
+      ) : (
+        history.map(session => {
+          const sd = session.sets_data || {}
+          const ms = session.metcon_sel || {}
+          const metconKey = Object.keys(ms).find(k => ms[k])
+          const metconLabel = metconKey && ms[metconKey] ? ms[metconKey].replace('metcon_', 'FINISHER ').toUpperCase() : null
+
+          const exLines = []
+          Object.entries(sd).forEach(([key, rows]) => {
+            const exId = key.split('__')[1]
+            const bestWeight = Math.max(0, ...rows.filter(r => r.done).map(r => Number(r.weight) || 0))
+            if (bestWeight > 0) {
+              const exName = exId.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())
+              exLines.push(`${exName}: ${bestWeight}lb`)
+            }
+          })
+
+          return (
+            <div key={session.id} style={S.histCard}>
+              <div style={S.histDay}>Day {session.day_idx + 1} — {session.day_name}</div>
+              <div style={S.histMeta}>{session.session_date} · {session.phase}</div>
+              {metconLabel && <div style={S.histMetcon}>{metconLabel}</div>}
+              {exLines.length > 0 ? (
+                exLines.map((line, i) => <div key={i} style={S.histExLine}>{line}</div>)
+              ) : (
+                <div style={S.histExLine}>No weights logged this session.</div>
+              )}
+            </div>
+          )
+        })
+      )}
+    </>
+  )
+
+  // ─── MAIN RENDER ───
+  return (
+    <div style={S.app}>
+      {/* Header */}
+      <div style={S.header}>
+        <div style={S.titleRow}>
+          <div style={S.titleLeft}>
+            <div style={S.h1}>IRON DISCIPLINE</div>
+            <div style={S.h2}>WORKOUT TRACKER</div>
+          </div>
+          <div>
+            <div style={S.dateText}>{fmtDate()}</div>
+            <div style={S.phaseText}>
+              {phase === 'hypertrophy' ? 'WK 1-2 · HYPERTROPHY' : 'WK 3-4 · STRENGTH'}
+            </div>
+          </div>
+        </div>
+
+        {/* Phase toggle */}
+        <div style={S.phaseToggle}>
+          <button style={S.phaseBtn(phase === 'hypertrophy')} onClick={() => setPhase('hypertrophy')}>
+            WEEKS 1–2 · HYPERTROPHY
+          </button>
+          <button style={S.phaseBtn(phase === 'strength')} onClick={() => setPhase('strength')}>
+            WEEKS 3–4 · STRENGTH
+          </button>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div style={S.tabs}>
+        {[['workout', 'WORKOUT'], ['prs', 'PRs'], ['log', 'HISTORY']].map(([id, label]) => (
+          <button key={id} style={S.tab(tab === id)} onClick={() => setTab(id)}>{label}</button>
+        ))}
+      </div>
+
+      {/* Tab content */}
+      {tab === 'workout' && renderWorkout()}
+      {tab === 'prs' && renderPRs()}
+      {tab === 'log' && renderHistory()}
+    </div>
+  )
+}
