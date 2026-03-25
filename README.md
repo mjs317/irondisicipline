@@ -12,13 +12,15 @@ Personal workout tracker (React + Vite + Supabase + Vercel) with optional AI coa
 | `VITE_SUPABASE_ANON_KEY` | Supabase anon (public) key |
 | `VITE_USER_ID` | Single stable string for row scoping (default `michael` in code) |
 
-### Vercel serverless (`api/coach.js`)
+### Vercel serverless (`api/coach.js`, `api/plan-week.js`)
 
 | Variable | Purpose |
 |----------|---------|
-| `ANTHROPIC_API_KEY` | Claude API key for **Get coaching** |
+| `ANTHROPIC_API_KEY` | Claude API key for **Get coaching**, **follow-up**, **block coach**, and **Generate week weights** |
 
 Set these in Vercel **Project → Settings → Environment Variables** and redeploy.
+
+**Endpoints:** `/api/coach` (session + structured JSON + follow-up messages), `/api/plan-week` (JSON weight suggestions). The Vite dev proxy sends all `/api/*` routes to `vercel dev` on port 3000.
 
 ## Supabase schema & RLS
 
@@ -54,7 +56,15 @@ Vite runs on **http://localhost:5173** (see `vite.config.js`).
 npx vercel dev --listen 3000
 ```
 
-Then **Get coaching** works from the Vite app. Without `vercel dev`, the proxy will fail.
+Then **Get coaching** and **plan week** work from the Vite app. Without `vercel dev`, the proxy will fail.
+
+## Features (in-app)
+
+- **PRs** are recomputed from all saved `workout_sessions` (up to 500 rows) so correcting a bad entry updates all-time bests.
+- **Export / import JSON** backup (PRs tab and Stats tab).
+- **STATS** tab: estimated tonnage, session streak, sessions per ISO week, recent best weights per lift.
+- **AI week plan:** suggests working weights from history + PRs; **Apply this day** / **Apply all days** fills weight fields for the current phase.
+- **Coach context** chips (run load, sleep, deload, race week), **BLOCK** mini-coach per circuit, structured session summary (JSON), and **follow-up** questions.
 
 ## Build
 

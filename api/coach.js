@@ -1,4 +1,15 @@
 const MAX_PROMPT_CHARS = 32000
+const MAX_MESSAGES_CHARS = 48000
+
+const JSON_COACH_SYSTEM = `You are a strength coach. Respond with ONLY valid JSON (no markdown) in this exact shape:
+{
+  "grade": "A" | "B" | "C" | "D",
+  "summary": "one sentence",
+  "bullets": ["string", "string"],
+  "risks": ["string"],
+  "next_session_focus": "string"
+}
+Be direct and specific. Use short strings in arrays.`
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -22,15 +33,32 @@ export default async function handler(req, res) {
     }
   }
 
-  const prompt = body?.prompt
-  if (typeof prompt !== 'string' || !prompt.trim()) {
-    res.status(400).json({ error: { message: 'Missing or invalid prompt' } })
-    return
+  const useMessages = Array.isArray(body?.messages) && body.messages.length > 0
+  let messages
+  if (useMessages) {
+    const serialized = JSON.stringify(body.messages)
+    if (serialized.length > MAX_MESSAGES_CHARS) {
+      res.status(400).json({ error: { message: `messages exceed ${MAX_MESSAGES_CHARS} characters` } })
+      return
+    }
+    messages = body.messages
+  } else {
+    const prompt = body?.prompt
+    if (typeof prompt !== 'string' || !prompt.trim()) {
+      res.status(400).json({ error: { message: 'Missing or invalid prompt' } })
+      return
+    }
+    if (prompt.length > MAX_PROMPT_CHARS) {
+      res.status(400).json({ error: { message: `Prompt exceeds ${MAX_PROMPT_CHARS} characters` } })
+      return
+    }
+    messages = [{ role: 'user', content: prompt }]
   }
-  if (prompt.length > MAX_PROMPT_CHARS) {
-    res.status(400).json({ error: { message: `Prompt exceeds ${MAX_PROMPT_CHARS} characters` } })
-    return
-  }
+
+  const jsonMode = Boolean(body?.jsonMode)
+  const system = typeof body?.systemPrompt === 'string' && body.systemPrompt.trim()
+    ? body.systemPrompt.trim()
+    : (jsonMode ? JSON_COACH_SYSTEM : undefined)
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -42,8 +70,9 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 1000,
-        messages: [{ role: 'user', content: prompt }]
+        max_tokens: jsonMode ? 1500 : 1000,
+        ...(system ? { system } : {}),
+        messages
       })
     })
 

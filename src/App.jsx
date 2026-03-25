@@ -1,5 +1,18 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react'
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { supabase, supabaseReady, USER_ID } from './supabase'
+import {
+  recalculatePrsFromSessions,
+  syncPersonalRecordsToDb,
+  totalTonnageFromSessions,
+  sessionsPerWeek,
+  exerciseTrendFromSessions,
+  sessionDayStreak,
+  buildProgramOutline,
+  findSetKeyForExercise
+} from './trainingUtils'
+import { buildExportPayload, downloadJson, validateImportPayload } from './exportImport'
+
+const HISTORY_LIMIT = 500
 
 // ─── Colors ───
 const BG      = '#0a0a0a'
@@ -372,8 +385,19 @@ export default function App() {
   const [metconByPhase, setMetconByPhase] = useState({ hypertrophy: {}, strength: {} })
   const [prs, setPrs] = useState({})
   const [history, setHistory] = useState([])
-  const [aiResponse, setAiResponse] = useState('')
   const [aiLoading, setAiLoading] = useState(false)
+  const [coachStructured, setCoachStructured] = useState(null)
+  const [coachPlain, setCoachPlain] = useState('')
+  const [lastUserPrompt, setLastUserPrompt] = useState('')
+  const [lastCoachMsg, setLastCoachMsg] = useState('')
+  const [followUp, setFollowUp] = useState('')
+  const [coachContext, setCoachContext] = useState({ running: 'normal', sleep: 'ok', deload: false, race: false })
+  const [circuitCoachId, setCircuitCoachId] = useState(null)
+  const [planLoading, setPlanLoading] = useState(false)
+  const [planError, setPlanError] = useState('')
+  const [planData, setPlanData] = useState(null)
+  const [importMsg, setImportMsg] = useState('')
+  const importRef = useRef(null)
   const [saveMsg, setSaveMsg] = useState('')
   const [noteOpen, setNoteOpen] = useState({})
   const [online, setOnline] = useState(navigator.onLine)
@@ -432,15 +456,22 @@ export default function App() {
       try {
         const [prRes, histRes, todayRes] = await Promise.all([
           supabase.from('personal_records').select('exercise_id, weight, recorded_date').eq('user_id', USER_ID),
-          supabase.from('workout_sessions').select('*').eq('user_id', USER_ID).order('session_date', { ascending: false }).limit(100),
+          supabase.from('workout_sessions').select('*').eq('user_id', USER_ID).order('session_date', { ascending: false }).limit(HISTORY_LIMIT),
           supabase.from('today_log').select('sets_data, metcon_sel').eq('user_id', USER_ID).eq('log_date', today()).maybeSingle()
         ])
-        if (prRes.data) {
-          const p = {}
-          prRes.data.forEach(r => { p[r.exercise_id] = { weight: Number(r.weight), date: r.recorded_date } })
-          setPrs(p)
+        if (histRes.data?.length) {
+          setHistory(histRes.data)
+          setPrs(recalculatePrsFromSessions(histRes.data))
+        } else {
+          setHistory([])
+          if (prRes.data?.length) {
+            const p = {}
+            prRes.data.forEach(r => { p[r.exercise_id] = { weight: Number(r.weight), date: r.recorded_date } })
+            setPrs(p)
+          } else {
+            setPrs({})
+          }
         }
-        if (histRes.data) setHistory(histRes.data)
         if (todayRes.data) {
           if (todayRes.data.sets_data) setSetsByPhase(migrateTodayLogPayload(todayRes.data.sets_data))
           if (todayRes.data.metcon_sel) setMetconByPhase(migrateTodayLogPayload(todayRes.data.metcon_sel))
@@ -523,27 +554,6 @@ export default function App() {
     if (!supabase) { setSaveMsg('ERR: DB not configured'); setTimeout(() => setSaveMsg(''), 3000); return }
     setSaveMsg('SAVING...')
     try {
-      const prUpserts = []
-      for (const circuit of dayData.circuits) {
-        if (circuit.isMetcon) continue
-        for (const ex of circuit.exercises) {
-          if (!ex.score) continue
-          const key = circuit.id + '__' + ex.id
-          const rows = sets[key] || []
-          let maxW = 0
-          rows.forEach(r => { if (r.done && r.weight && Number(r.weight) > maxW) maxW = Number(r.weight) })
-          if (maxW > 0 && (!prs[ex.id] || maxW > prs[ex.id].weight)) {
-            prUpserts.push({ user_id: USER_ID, exercise_id: ex.id, weight: maxW, recorded_date: today() })
-          }
-        }
-      }
-      if (prUpserts.length > 0) {
-        await supabase.from('personal_records').upsert(prUpserts, { onConflict: 'user_id,exercise_id' })
-        const newPrs = { ...prs }
-        prUpserts.forEach(u => { newPrs[u.exercise_id] = { weight: u.weight, date: u.recorded_date } })
-        setPrs(newPrs)
-      }
-
       await supabase.from('workout_sessions').upsert({
         user_id: USER_ID,
         session_date: today(),
@@ -562,8 +572,13 @@ export default function App() {
         updated_at: new Date().toISOString()
       }, { onConflict: 'user_id,log_date' })
 
-      const { data: freshHist } = await supabase.from('workout_sessions').select('*').eq('user_id', USER_ID).order('session_date', { ascending: false }).limit(100)
-      if (freshHist) setHistory(freshHist)
+      const { data: freshHist } = await supabase.from('workout_sessions').select('*').eq('user_id', USER_ID).order('session_date', { ascending: false }).limit(HISTORY_LIMIT)
+      if (freshHist?.length) {
+        setHistory(freshHist)
+        const prMap = recalculatePrsFromSessions(freshHist)
+        setPrs(prMap)
+        await syncPersonalRecordsToDb(supabase, USER_ID, prMap)
+      }
 
       setSaveMsg('✓ SAVED')
       setTimeout(() => setSaveMsg(''), 2000)
@@ -574,24 +589,41 @@ export default function App() {
     }
   }
 
+  const buildExerciseLines = (circuits) => {
+    const lines = []
+    for (const circuit of circuits) {
+      if (circuit.isMetcon) continue
+      for (const ex of circuit.exercises) {
+        const key = circuit.id + '__' + ex.id
+        const rows = sets[key] || []
+        const logged = rows.filter(r => r.weight || r.reps).map((r, i) => `Set ${i+1}: ${r.weight || '?'}lb x ${r.reps || '?'} ${r.done ? '(done)' : ''}`).join(', ')
+        const pr = prs[ex.id] ? `PR: ${prs[ex.id].weight}lb (${prs[ex.id].date})` : 'No PR yet'
+        lines.push(`${ex.name} [target: ${ex.target}] — ${logged || 'no sets logged'} — ${pr}`)
+      }
+    }
+    return lines
+  }
+
+  const coachContextBlock = () => {
+    const c = coachContext
+    const parts = []
+    if (c.running && c.running !== 'normal') parts.push(`Running load: ${c.running}`)
+    if (c.sleep && c.sleep !== 'ok') parts.push(`Sleep/recovery: ${c.sleep}`)
+    if (c.deload) parts.push('Deload week: yes')
+    if (c.race) parts.push('Race week: yes')
+    return parts.length ? `\nAthlete context:\n${parts.map(p => `• ${p}`).join('\n')}` : ''
+  }
+
   // ─── AI Coaching ───
   const getCoaching = async () => {
     setAiLoading(true)
-    setAiResponse('')
+    setCoachPlain('')
+    setCoachStructured(null)
+    setFollowUp('')
     try {
-      const exerciseLines = []
-      for (const circuit of dayData.circuits) {
-        if (circuit.isMetcon) continue
-        for (const ex of circuit.exercises) {
-          const key = circuit.id + '__' + ex.id
-          const rows = sets[key] || []
-          const logged = rows.filter(r => r.weight || r.reps).map((r, i) => `Set ${i+1}: ${r.weight || '?'}lb x ${r.reps || '?'} ${r.done ? '(done)' : ''}`).join(', ')
-          const pr = prs[ex.id] ? `PR: ${prs[ex.id].weight}lb (${prs[ex.id].date})` : 'No PR yet'
-          exerciseLines.push(`${ex.name} [target: ${ex.target}] — ${logged || 'no sets logged'} — ${pr}`)
-        }
-      }
+      const exerciseLines = buildExerciseLines(dayData.circuits)
 
-      const sameDayHist = history.filter(h => h.day_idx === activeDay && h.phase === phase).slice(0, 3)
+      const sameDayHist = history.filter(h => h.day_idx === activeDay && (h.phase || 'hypertrophy') === phase).slice(0, 3)
       let histBlock = 'No previous sessions for this day.'
       if (sameDayHist.length > 0) {
         histBlock = sameDayHist.map(h => {
@@ -607,6 +639,7 @@ export default function App() {
       const prompt = `You are a strength coach reviewing a workout session. Be direct and specific.
 
 TODAY'S WORKOUT — ${phase.toUpperCase()} PHASE — Day ${activeDay + 1}: ${dayData.name}
+${coachContextBlock()}
 
 Exercises logged today:
 ${exerciseLines.join('\n')}
@@ -621,36 +654,252 @@ Respond with bullet points:
 • One-sentence session grade (A/B/C/D)
 • One specific goal for next session`
 
+      setLastUserPrompt(prompt)
+
       const res = await fetch('/api/coach', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt })
+        body: JSON.stringify({ prompt, jsonMode: true })
       })
       let data
       try {
         data = await res.json()
       } catch {
-        setAiResponse('Error: Could not read coach response')
+        setCoachPlain('Error: Could not read coach response')
         setAiLoading(false)
         return
       }
       if (!res.ok) {
-        setAiResponse('Error: ' + (data.error?.message || res.statusText))
+        setCoachPlain('Error: ' + (data.error?.message || res.statusText))
         setAiLoading(false)
         return
       }
       if (data.content && data.content[0]) {
-        setAiResponse(data.content[0].text)
+        const t = data.content[0].text
+        setLastCoachMsg(t)
+        try {
+          const stripped = t.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '')
+          setCoachStructured(JSON.parse(stripped))
+          setCoachPlain('')
+        } catch {
+          setCoachStructured(null)
+          setCoachPlain(t)
+        }
       } else if (data.error) {
-        setAiResponse('Error: ' + (data.error.message || JSON.stringify(data.error)))
+        setCoachPlain('Error: ' + (data.error.message || JSON.stringify(data.error)))
       } else {
-        setAiResponse(JSON.stringify(data, null, 2))
+        setCoachPlain(JSON.stringify(data, null, 2))
       }
     } catch (e) {
-      setAiResponse('Error: ' + e.message)
+      setCoachPlain('Error: ' + e.message)
     }
     setAiLoading(false)
   }
+
+  const getCircuitCoaching = async (circuit) => {
+    if (circuit.isMetcon) return
+    setCircuitCoachId(circuit.id)
+    setCoachStructured(null)
+    setCoachPlain('')
+    try {
+      const exerciseLines = buildExerciseLines([circuit])
+      const prompt = `You are a strength coach. One block only — be brief (5 bullets max).
+
+PHASE: ${phase} — Day ${activeDay + 1}: ${dayData.name}
+BLOCK: ${circuit.label}
+${coachContextBlock()}
+
+Logged:
+${exerciseLines.join('\n')}
+
+Give: form cue, weight adjustment if any, and one priority for next time.`
+
+      const res = await fetch('/api/coach', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, jsonMode: false })
+      })
+      let data
+      try {
+        data = await res.json()
+      } catch {
+        setCoachPlain('Error: Could not read coach response')
+        setCircuitCoachId(null)
+        return
+      }
+      if (!res.ok) {
+        setCoachPlain('Error: ' + (data.error?.message || res.statusText))
+        setCircuitCoachId(null)
+        return
+      }
+      if (data.content && data.content[0]) {
+        setCoachPlain(`[${circuit.label}]\n\n${data.content[0].text}`)
+        setLastCoachMsg(data.content[0].text)
+        setLastUserPrompt(prompt)
+      }
+    } catch (e) {
+      setCoachPlain('Error: ' + e.message)
+    }
+    setCircuitCoachId(null)
+  }
+
+  const submitFollowUp = async () => {
+    if (!followUp.trim() || !lastUserPrompt || !lastCoachMsg) return
+    setAiLoading(true)
+    try {
+      const messages = [
+        { role: 'user', content: lastUserPrompt },
+        { role: 'assistant', content: lastCoachMsg },
+        { role: 'user', content: followUp.trim() }
+      ]
+      const res = await fetch('/api/coach', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages, jsonMode: true })
+      })
+      let data
+      try {
+        data = await res.json()
+      } catch {
+        setCoachPlain('Error: Could not read follow-up')
+        setAiLoading(false)
+        return
+      }
+      if (!res.ok) {
+        setCoachPlain('Error: ' + (data.error?.message || res.statusText))
+        setAiLoading(false)
+        return
+      }
+      if (data.content && data.content[0]) {
+        const t = data.content[0].text
+        setLastCoachMsg(t)
+        try {
+          const stripped = t.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '')
+          setCoachStructured(JSON.parse(stripped))
+          setCoachPlain('')
+        } catch {
+          setCoachStructured(null)
+          setCoachPlain(t)
+        }
+      }
+      setFollowUp('')
+    } catch (e) {
+      setCoachPlain('Error: ' + e.message)
+    }
+    setAiLoading(false)
+  }
+
+  const requestPlanWeek = async () => {
+    setPlanLoading(true)
+    setPlanError('')
+    setPlanData(null)
+    try {
+      const res = await fetch('/api/plan-week', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          phase,
+          programOutline: buildProgramOutline(PHASES, phase),
+          recentSessions: history.slice(0, 40),
+          prsSnapshot: prs
+        })
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error?.message || res.statusText)
+      if (!data.plan) throw new Error('No plan in response')
+      setPlanData(data.plan)
+    } catch (e) {
+      setPlanError(e.message || 'Plan failed')
+    }
+    setPlanLoading(false)
+  }
+
+  const applyPlanWeights = (mode) => {
+    if (!planData?.suggestions?.length) return
+    setSetsByPhase(prev => {
+      const ph = phase
+      const cur = { ...prev[ph] }
+      for (const s of planData.suggestions) {
+        if (mode === 'day' && s.dayIndex !== activeDay) continue
+        const meta = findSetKeyForExercise(PHASES, phase, s.dayIndex, s.exerciseId)
+        if (!meta) continue
+        const rows = s.sets || []
+        const base = Array.from({ length: meta.totalSets }, (_, i) =>
+          (cur[meta.key] && cur[meta.key][i]) ? { ...cur[meta.key][i] } : { weight: '', reps: '', done: false }
+        )
+        rows.forEach((row, i) => {
+          if (i >= base.length) return
+          const w = row.weightLb
+          if (w == null || !Number.isFinite(Number(w))) return
+          base[i] = { ...base[i], weight: String(w) }
+        })
+        cur[meta.key] = base
+      }
+      return { ...prev, [ph]: cur }
+    })
+  }
+
+  const handleExport = () => {
+    const payload = buildExportPayload({
+      userId: USER_ID,
+      prs,
+      history,
+      setsByPhase,
+      metconByPhase,
+      logDate: today()
+    })
+    downloadJson(payload)
+  }
+
+  const handleImportFile = async (e) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    setImportMsg('Reading...')
+    try {
+      const text = await file.text()
+      const raw = JSON.parse(text)
+      const v = validateImportPayload(raw)
+      if (!v.ok) {
+        setImportMsg(v.error)
+        return
+      }
+      const d = v.data
+      const sessions = Array.isArray(d.workoutSessions) ? d.workoutSessions : []
+      setHistory(sessions)
+      const prMap = recalculatePrsFromSessions(sessions)
+      const prFinal = Object.keys(prMap).length ? prMap : (d.personalRecords && typeof d.personalRecords === 'object' ? d.personalRecords : {})
+      setPrs(prFinal)
+      if (d.todayLog?.sets_data) setSetsByPhase(migrateTodayLogPayload(d.todayLog.sets_data))
+      if (d.todayLog?.metcon_sel) setMetconByPhase(migrateTodayLogPayload(d.todayLog.metcon_sel))
+
+      if (supabase) {
+        await syncPersonalRecordsToDb(supabase, USER_ID, prFinal)
+        for (const row of sessions) {
+          const { id: _id, ...rest } = row
+          await supabase.from('workout_sessions').upsert(rest, { onConflict: 'user_id,session_date,day_idx,phase' })
+        }
+        await supabase.from('today_log').upsert({
+          user_id: USER_ID,
+          log_date: today(),
+          sets_data: migrateTodayLogPayload(d.todayLog?.sets_data || {}),
+          metcon_sel: migrateTodayLogPayload(d.todayLog?.metcon_sel || {}),
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'user_id,log_date' })
+      }
+      setImportMsg('Imported.')
+      setTimeout(() => setImportMsg(''), 3000)
+    } catch (err) {
+      setImportMsg('Error: ' + err.message)
+    }
+  }
+
+  const statsBundle = useMemo(() => ({
+    tonnage: totalTonnageFromSessions(history),
+    perWeek: sessionsPerWeek(history),
+    streak: sessionDayStreak(history),
+    trends: exerciseTrendFromSessions(history, 5)
+  }), [history])
 
   // ─── Done counting ───
   const circuitDoneCount = (circuit) => {
@@ -736,9 +985,25 @@ Respond with bullet points:
     }),
     tabs: { display: 'flex', gap: 0, borderBottom: `1px solid ${BORDER}`, padding: '0 12px' },
     tab: (active) => ({
-      flex: 1, padding: '12px 0', border: 'none', borderBottom: active ? `2px solid ${ACCENT}` : '2px solid transparent',
-      background: 'transparent', color: active ? ACCENT : MUTED, fontFamily: FONT, fontSize: 11,
-      fontWeight: 700, letterSpacing: 2, textAlign: 'center', minHeight: 44
+      flex: 1, padding: '10px 2px', border: 'none', borderBottom: active ? `2px solid ${ACCENT}` : '2px solid transparent',
+      background: 'transparent', color: active ? ACCENT : MUTED, fontFamily: FONT, fontSize: 9,
+      fontWeight: 700, letterSpacing: 1, textAlign: 'center', minHeight: 44
+    }),
+    chipRow: { display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12, alignItems: 'center' },
+    chipLabel: { fontSize: 9, color: MUTED, width: '100%', letterSpacing: 1 },
+    chipBtn: (on) => ({
+      fontSize: 9, padding: '6px 10px', borderRadius: 4, border: `1px solid ${on ? ACCENT : BORDER}`,
+      background: on ? ACCENT + '22' : 'transparent', color: on ? ACCENT : MUTED, fontFamily: FONT, fontWeight: 700
+    }),
+    statCard: {
+      background: CARD, border: `1px solid ${BORDER}`, borderRadius: 6, padding: 12, marginBottom: 10
+    },
+    statLabel: { fontSize: 10, color: MUTED, letterSpacing: 1 },
+    statValue: { fontSize: 18, fontWeight: 700, color: ACCENT, marginTop: 4 },
+    planBox: { background: CARD, border: `1px solid ${BLUE}40`, borderRadius: 6, padding: 12, marginBottom: 12 },
+    miniCoachBtn: (c, loading, pressed) => ({
+      fontSize: 9, padding: '6px 8px', border: `1px solid ${BLUE}`, borderRadius: 4, background: BLUE + '12',
+      color: BLUE, fontFamily: FONT, fontWeight: 700, minHeight: 32, opacity: loading ? 0.5 : 1
     }),
     daySelector: { display: 'flex', gap: 6, margin: '8px 0 12px' },
     dayBtn: (active) => ({
@@ -900,7 +1165,15 @@ Respond with bullet points:
                   {circuit.isMetcon ? 'choose one · rest as programmed' : `${circuit.sets} sets · rest ${circuit.rest}`}
                 </div>
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                <button
+                  type="button"
+                  style={S.miniCoachBtn(c, circuitCoachId === circuit.id, pressed === 'cc_' + circuit.id)}
+                  onClick={() => { onPress('cc_' + circuit.id); getCircuitCoaching(circuit) }}
+                  disabled={circuit.isMetcon || circuitCoachId === circuit.id}
+                >
+                  {circuitCoachId === circuit.id ? '...' : 'BLOCK'}
+                </button>
                 <button
                   style={S.goalBtn(c, pressed === 'goal_' + circuit.id)}
                   onClick={() => { onPress('goal_' + circuit.id); setNoteOpen(p => ({ ...p, [circuit.id]: !p[circuit.id] })) }}
@@ -1014,6 +1287,41 @@ Respond with bullet points:
         )
       })}
 
+      <div style={S.chipRow}>
+        <span style={S.chipLabel}>COACH CONTEXT</span>
+        {[
+          ['running', 'RUN', ['normal', 'low', 'high'], { normal: 'normal', low: 'low', high: 'high' }],
+          ['sleep', 'SLEEP', ['ok', 'poor'], { ok: 'ok', poor: 'poor' }],
+        ].map(([key, label, opts, map]) => (
+          <span key={key} style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+            <span style={{ fontSize: 8, color: MUTED }}>{label}</span>
+            {opts.map(o => (
+              <button
+                key={o}
+                type="button"
+                style={S.chipBtn(coachContext[key] === o)}
+                onClick={() => setCoachContext(x => ({ ...x, [key]: o }))}
+              >
+                {map[o] || o}
+              </button>
+            ))}
+          </span>
+        ))}
+        {[
+          ['deload', 'DELOAD'],
+          ['race', 'RACE WK'],
+        ].map(([key, label]) => (
+          <button
+            key={key}
+            type="button"
+            style={S.chipBtn(coachContext[key])}
+            onClick={() => setCoachContext(x => ({ ...x, [key]: !x[key] }))}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
       <div style={S.btnRow}>
         <button
           style={S.saveBtn(pressed === 'save')}
@@ -1030,14 +1338,131 @@ Respond with bullet points:
         </button>
       </div>
 
-      {aiResponse && (
+      <div style={S.planBox}>
+        <div style={{ fontSize: 10, fontWeight: 700, color: BLUE, letterSpacing: 1, marginBottom: 8 }}>AI WEEK PLAN</div>
+        <div style={{ fontSize: 10, color: MUTED, marginBottom: 8 }}>Uses last 40 sessions + PRs + current phase program.</div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            style={S.coachBtn(planLoading, pressed === 'plan')}
+            onClick={() => { onPress('plan'); requestPlanWeek() }}
+            disabled={planLoading}
+          >
+            {planLoading ? 'PLANNING...' : 'GENERATE WEEK WEIGHTS'}
+          </button>
+          {planData?.suggestions?.length > 0 && (
+            <>
+              <button type="button" style={S.saveBtn(pressed === 'applyD')} onClick={() => { onPress('applyD'); applyPlanWeights('day') }}>APPLY THIS DAY</button>
+              <button type="button" style={S.saveBtn(pressed === 'applyA')} onClick={() => { onPress('applyA'); applyPlanWeights('all') }}>APPLY ALL DAYS</button>
+            </>
+          )}
+        </div>
+        {planError && <div style={{ color: RED, fontSize: 11, marginTop: 8 }}>{planError}</div>}
+        {planData?.notes && <div style={{ fontSize: 11, color: TEXT, marginTop: 8, lineHeight: 1.5 }}>{planData.notes}</div>}
+        {planData?.suggestions?.length > 0 && (
+          <div style={{ fontSize: 10, color: MUTED, marginTop: 10, maxHeight: 160, overflow: 'auto' }}>
+            {planData.suggestions.slice(0, 12).map((s, i) => (
+              <div key={i} style={{ marginBottom: 4 }}>
+                D{s.dayIndex + 1} · {s.exerciseId}: {(s.sets || []).map(x => x.weightLb).join(' / ')} lb
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {coachStructured && (
         <div style={S.aiPanel}>
           <div style={S.aiLabel}>AI COACH</div>
-          <div style={S.aiText}>{aiResponse}</div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: ACCENT, marginBottom: 6 }}>Grade: {coachStructured.grade}</div>
+          <div style={{ fontSize: 12, marginBottom: 10 }}>{coachStructured.summary}</div>
+          {(coachStructured.bullets || []).length > 0 && (
+            <ul style={{ margin: '0 0 8px 16px', fontSize: 11, lineHeight: 1.5 }}>
+              {coachStructured.bullets.map((b, i) => <li key={i}>{b}</li>)}
+            </ul>
+          )}
+          {(coachStructured.risks || []).length > 0 && (
+            <div style={{ fontSize: 10, color: RED, marginBottom: 8 }}>Risks: {coachStructured.risks.join(' · ')}</div>
+          )}
+          {coachStructured.next_session_focus && (
+            <div style={{ fontSize: 11, color: BLUE }}>Next: {coachStructured.next_session_focus}</div>
+          )}
+        </div>
+      )}
+
+      {coachPlain && (
+        <div style={S.aiPanel}>
+          <div style={S.aiLabel}>AI COACH</div>
+          <div style={S.aiText}>{coachPlain}</div>
+        </div>
+      )}
+
+      {(lastCoachMsg && lastUserPrompt) && (
+        <div style={{ marginBottom: 12 }}>
+          <input
+            type="text"
+            placeholder="Follow-up question..."
+            value={followUp}
+            onChange={e => setFollowUp(e.target.value)}
+            style={{ ...S.setInput(false), marginBottom: 8, textAlign: 'left', padding: '10px' }}
+          />
+          <button type="button" style={S.coachBtn(aiLoading, false)} onClick={submitFollowUp} disabled={aiLoading || !followUp.trim()}>
+            ASK FOLLOW-UP
+          </button>
         </div>
       )}
     </>
   )
+
+  // ─── RENDER: STATS TAB ───
+  const renderStats = () => {
+    const wk = Object.entries(statsBundle.perWeek).sort((a, b) => b[0].localeCompare(a[0])).slice(0, 10)
+    const trend = statsBundle.trends
+    const topIds = Object.keys(trend).sort().slice(0, 16)
+    return (
+      <>
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, letterSpacing: 2 }}>TRAINING STATS</div>
+          <div style={{ fontSize: 10, color: MUTED, marginTop: 4 }}>Derived from saved sessions in history.</div>
+        </div>
+        <div style={S.statCard}>
+          <div style={S.statLabel}>EST. TONNAGE (SUM OF WEIGHT × REPS, DONE SETS)</div>
+          <div style={S.statValue}>{statsBundle.tonnage.toLocaleString()}</div>
+        </div>
+        <div style={S.statCard}>
+          <div style={S.statLabel}>CONSECUTIVE TRAINING DAYS (FROM LATEST SESSION)</div>
+          <div style={S.statValue}>{statsBundle.streak}</div>
+        </div>
+        <div style={S.statCard}>
+          <div style={S.statLabel}>SESSIONS PER ISO WEEK</div>
+          {wk.length === 0 ? (
+            <div style={{ fontSize: 11, color: MUTED, marginTop: 6 }}>No data.</div>
+          ) : (
+            wk.map(([k, v]) => (
+              <div key={k} style={{ fontSize: 11, marginTop: 6, color: TEXT }}>{k}: {v}</div>
+            ))
+          )}
+        </div>
+        <div style={{ fontSize: 12, fontWeight: 700, color: ACCENT, margin: '16px 0 8px', letterSpacing: 1 }}>RECENT BEST WEIGHTS BY LIFT</div>
+        {topIds.length === 0 ? (
+          <div style={S.emptyText}>Log sessions to see trends.</div>
+        ) : (
+          topIds.map(exId => (
+            <div key={exId} style={S.statCard}>
+              <div style={{ fontSize: 12, fontWeight: 700 }}>{exId.replace(/_/g, ' ')}</div>
+              {(trend[exId] || []).map((x, i) => (
+                <div key={i} style={{ fontSize: 10, color: MUTED, marginTop: 4 }}>{x.date} — {x.maxWeight} lb</div>
+              ))}
+            </div>
+          ))
+        )}
+        <div style={{ display: 'flex', gap: 8, marginTop: 16, flexWrap: 'wrap' }}>
+          <button type="button" style={S.saveBtn(pressed === 'exs')} onClick={() => { onPress('exs'); handleExport() }}>EXPORT JSON</button>
+          <button type="button" style={S.coachBtn(false, pressed === 'ims')} onClick={() => { onPress('ims'); importRef.current?.click() }}>IMPORT JSON</button>
+        </div>
+        {importMsg && <div style={{ fontSize: 10, color: ACCENT, marginTop: 8 }}>{importMsg}</div>}
+      </>
+    )
+  }
 
   // ─── RENDER: PRs TAB ───
   const renderPRs = () => {
@@ -1046,6 +1471,11 @@ Respond with bullet points:
 
     return (
       <>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
+          <button type="button" style={S.saveBtn(pressed === 'exp')} onClick={() => { onPress('exp'); handleExport() }}>EXPORT JSON</button>
+          <button type="button" style={S.coachBtn(false, pressed === 'imp')} onClick={() => { onPress('imp'); importRef.current?.click() }}>IMPORT JSON</button>
+        </div>
+        {importMsg && <div style={{ fontSize: 10, color: ACCENT, marginBottom: 8 }}>{importMsg}</div>}
         <div style={{ marginBottom: 16 }}>
           <div style={{ fontSize: 14, fontWeight: 700, letterSpacing: 2 }}>ALL TIME / PERSONAL RECORDS</div>
           <div style={{ fontSize: 10, color: MUTED, marginTop: 4 }}>Tracks both hypertrophy and strength phase lifts.</div>
@@ -1117,6 +1547,7 @@ Respond with bullet points:
   // ─── MAIN RENDER ───
   return (
     <div style={S.shell}>
+      <input ref={importRef} type="file" accept="application/json,.json" style={{ display: 'none' }} onChange={handleImportFile} />
       {/* Sticky header + tabs */}
       <div style={S.stickyTop}>
         {!online && (
@@ -1152,8 +1583,8 @@ Respond with bullet points:
         </div>
 
         <div style={S.tabs}>
-          {[['workout', 'WORKOUT'], ['prs', 'PRs'], ['log', 'HISTORY']].map(([id, label]) => (
-            <button key={id} style={S.tab(tab === id)} onClick={() => setTab(id)}>{label}</button>
+          {[['workout', 'WORKOUT'], ['prs', 'PRs'], ['log', 'HISTORY'], ['stats', 'STATS']].map(([id, label]) => (
+            <button key={id} type="button" style={S.tab(tab === id)} onClick={() => setTab(id)}>{label}</button>
           ))}
         </div>
       </div>
@@ -1163,6 +1594,7 @@ Respond with bullet points:
         {tab === 'workout' && renderWorkout()}
         {tab === 'prs' && renderPRs()}
         {tab === 'log' && renderHistory()}
+        {tab === 'stats' && renderStats()}
       </div>
     </div>
   )
