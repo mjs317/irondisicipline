@@ -11,7 +11,7 @@ const GREEN   = '#22c55e'
 const PURPLE  = '#7C3AED'
 const RED     = '#DC2626'
 const TEXT    = '#e5e5e5'
-const MUTED   = '#555555'
+const MUTED   = '#777777'
 
 const FONT = "'Courier New', Courier, monospace"
 
@@ -721,11 +721,11 @@ Respond with bullet points:
     dayNum: { fontSize: 10, color: MUTED, letterSpacing: 2 },
     dayTag: { fontSize: 10, color: ACCENT, letterSpacing: 1, marginTop: 2 },
     dayName: { fontSize: 18, fontWeight: 700, marginTop: 4 },
-    dayNote: { fontSize: 11, color: MUTED, marginTop: 6, paddingLeft: 10, borderLeft: `2px solid ${ACCENT}`, lineHeight: 1.4 },
+    dayNote: { fontSize: 11, color: '#aaaaaa', marginTop: 6, paddingLeft: 10, borderLeft: `2px solid ${ACCENT}`, lineHeight: 1.5 },
     legend: { display: 'flex', gap: 12, marginBottom: 14, flexWrap: 'wrap' },
     legendItem: { display: 'flex', alignItems: 'center', gap: 4 },
     legendSwatch: (c) => ({ width: 10, height: 10, borderRadius: 2, background: c }),
-    legendLabel: { fontSize: 9, color: MUTED, letterSpacing: 1 },
+    legendLabel: { fontSize: 9, color: '#999999', letterSpacing: 1 },
     circuitCard: (c) => ({
       background: CARD, border: `2px solid ${c}`, borderRadius: 6, marginBottom: 12, overflow: 'hidden'
     }),
@@ -734,7 +734,7 @@ Respond with bullet points:
       alignItems: 'center', flexWrap: 'wrap', gap: 4, minHeight: 48
     }),
     circuitLabel: (c) => ({ fontSize: 10, fontWeight: 700, color: c, letterSpacing: 1 }),
-    circuitMeta: { fontSize: 9, color: MUTED, marginTop: 2 },
+    circuitMeta: { fontSize: 10, color: '#999999', marginTop: 2 },
     circuitDone: (complete) => ({
       fontSize: 11, fontWeight: 700, color: complete ? GREEN : MUTED, minWidth: 44, textAlign: 'right'
     }),
@@ -752,10 +752,10 @@ Respond with bullet points:
     exerciseBlock: { padding: '10px 10px 8px' },
     exerciseHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
     exerciseName: { fontSize: 13, fontWeight: 700 },
-    exerciseTarget: { fontSize: 9, color: MUTED, marginTop: 1 },
+    exerciseTarget: { fontSize: 11, color: '#999999', marginTop: 2 },
     prBadge: { fontSize: 9, fontWeight: 700, color: ACCENT, background: ACCENT + '20', padding: '3px 8px', borderRadius: 3 },
     colHeaders: { display: 'grid', gridTemplateColumns: '30px 1fr 1fr 44px', gap: 6, marginBottom: 6, padding: '0 2px' },
-    colHeader: { fontSize: 8, color: MUTED, letterSpacing: 1, textAlign: 'center' },
+    colHeader: { fontSize: 9, color: '#999999', letterSpacing: 1, textAlign: 'center', fontWeight: 700 },
     setRow: { display: 'grid', gridTemplateColumns: '30px 1fr 1fr 44px', gap: 6, marginBottom: 6, alignItems: 'center', padding: '0 2px' },
     setNum: { fontSize: 12, color: MUTED, textAlign: 'center', fontWeight: 700 },
     setInput: (done) => ({
