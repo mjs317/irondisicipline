@@ -352,6 +352,15 @@ const STRENGTH = [
 
 const PHASES = { hypertrophy: HYPERTROPHY, strength: STRENGTH }
 
+/** Migrate flat JSON from older today_log rows into per-phase buckets. */
+function migrateTodayLogPayload(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { hypertrophy: {}, strength: {} }
+  if (Object.prototype.hasOwnProperty.call(raw, 'hypertrophy') || Object.prototype.hasOwnProperty.call(raw, 'strength')) {
+    return { hypertrophy: raw.hypertrophy || {}, strength: raw.strength || {} }
+  }
+  return { hypertrophy: { ...raw }, strength: {} }
+}
+
 // ─── APP ───
 
 export default function App() {
@@ -359,8 +368,8 @@ export default function App() {
   const [tab, setTab] = useState('workout')
   const [phase, setPhase] = useState('hypertrophy')
   const [activeDay, setActiveDay] = useState(0)
-  const [sets, setSets] = useState({})
-  const [metconSel, setMetconSel] = useState({})
+  const [setsByPhase, setSetsByPhase] = useState({ hypertrophy: {}, strength: {} })
+  const [metconByPhase, setMetconByPhase] = useState({ hypertrophy: {}, strength: {} })
   const [prs, setPrs] = useState({})
   const [history, setHistory] = useState([])
   const [aiResponse, setAiResponse] = useState('')
@@ -375,6 +384,8 @@ export default function App() {
 
   const days = PHASES[phase]
   const dayData = days[activeDay]
+  const sets = setsByPhase[phase] || {}
+  const metconSel = metconByPhase[phase] || {}
 
   // ─── Online/offline tracking ───
   useEffect(() => {
@@ -431,8 +442,8 @@ export default function App() {
         }
         if (histRes.data) setHistory(histRes.data)
         if (todayRes.data) {
-          if (todayRes.data.sets_data) setSets(todayRes.data.sets_data)
-          if (todayRes.data.metcon_sel) setMetconSel(todayRes.data.metcon_sel)
+          if (todayRes.data.sets_data) setSetsByPhase(migrateTodayLogPayload(todayRes.data.sets_data))
+          if (todayRes.data.metcon_sel) setMetconByPhase(migrateTodayLogPayload(todayRes.data.metcon_sel))
         }
       } catch (e) {
         console.error('Load error:', e)
@@ -449,8 +460,8 @@ export default function App() {
       const payload = {
         user_id: USER_ID,
         log_date: today(),
-        sets_data: sets,
-        metcon_sel: metconSel,
+        sets_data: setsByPhase,
+        metcon_sel: metconByPhase,
         updated_at: new Date().toISOString()
       }
       try {
@@ -462,7 +473,7 @@ export default function App() {
       }
     }, 2000)
     return () => { if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current) }
-  }, [sets, metconSel, loaded])
+  }, [setsByPhase, metconByPhase, loaded])
 
   // ─── Scroll to top on tab/day change ───
   useEffect(() => {
@@ -472,32 +483,40 @@ export default function App() {
   // ─── Set row updates ───
   const updateSet = useCallback((circuitId, exId, idx, field, val, totalSets) => {
     const key = circuitId + '__' + exId
-    setSets(prev => {
+    setSetsByPhase(prev => {
+      const cur = prev[phase] || {}
       const base = Array.from({ length: totalSets }, (_, i) =>
-        (prev[key] && prev[key][i]) ? { ...prev[key][i] } : { weight: '', reps: '', done: false }
+        (cur[key] && cur[key][i]) ? { ...cur[key][i] } : { weight: '', reps: '', done: false }
       )
       base[idx] = { ...base[idx], [field]: val }
-      return { ...prev, [key]: base }
+      return { ...prev, [phase]: { ...cur, [key]: base } }
     })
-  }, [])
+  }, [phase])
 
   const toggleDone = useCallback((circuitId, exId, idx, totalSets) => {
     const key = circuitId + '__' + exId
-    setSets(prev => {
+    setSetsByPhase(prev => {
+      const cur = prev[phase] || {}
       const base = Array.from({ length: totalSets }, (_, i) =>
-        (prev[key] && prev[key][i]) ? { ...prev[key][i] } : { weight: '', reps: '', done: false }
+        (cur[key] && cur[key][i]) ? { ...cur[key][i] } : { weight: '', reps: '', done: false }
       )
       base[idx] = { ...base[idx], done: !base[idx].done }
-      return { ...prev, [key]: base }
+      return { ...prev, [phase]: { ...cur, [key]: base } }
     })
-  }, [])
+  }, [phase])
 
   const toggleMetcon = useCallback((circuitId, exId) => {
-    setMetconSel(prev => ({
-      ...prev,
-      [circuitId]: prev[circuitId] === exId ? null : exId
-    }))
-  }, [])
+    setMetconByPhase(prev => {
+      const cur = prev[phase] || {}
+      return {
+        ...prev,
+        [phase]: {
+          ...cur,
+          [circuitId]: cur[circuitId] === exId ? null : exId
+        }
+      }
+    })
+  }, [phase])
 
   // ─── Save workout ───
   const saveWorkout = async () => {
@@ -533,13 +552,13 @@ export default function App() {
         phase,
         sets_data: sets,
         metcon_sel: metconSel
-      }, { onConflict: 'user_id,session_date,day_idx' })
+      }, { onConflict: 'user_id,session_date,day_idx,phase' })
 
       await supabase.from('today_log').upsert({
         user_id: USER_ID,
         log_date: today(),
-        sets_data: sets,
-        metcon_sel: metconSel,
+        sets_data: setsByPhase,
+        metcon_sel: metconByPhase,
         updated_at: new Date().toISOString()
       }, { onConflict: 'user_id,log_date' })
 
@@ -607,7 +626,19 @@ Respond with bullet points:
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt })
       })
-      const data = await res.json()
+      let data
+      try {
+        data = await res.json()
+      } catch {
+        setAiResponse('Error: Could not read coach response')
+        setAiLoading(false)
+        return
+      }
+      if (!res.ok) {
+        setAiResponse('Error: ' + (data.error?.message || res.statusText))
+        setAiLoading(false)
+        return
+      }
       if (data.content && data.content[0]) {
         setAiResponse(data.content[0].text)
       } else if (data.error) {

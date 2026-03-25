@@ -1,4 +1,4 @@
-const CACHE_NAME = 'iron-discipline-v1'
+const CACHE_NAME = 'iron-discipline-v2'
 
 const PRECACHE = [
   '/',
@@ -34,13 +34,18 @@ self.addEventListener('fetch', (e) => {
 
   if (url.pathname.startsWith('/api/')) return
 
+  // Network-first: always try network for the SPA shell and hashed assets so deploys show up quickly.
   e.respondWith(
     fetch(request)
-      .then(response => {
-        const clone = response.clone()
-        caches.open(CACHE_NAME).then(cache => cache.put(request, clone))
+      .then((response) => {
+        if (response.ok) {
+          const clone = response.clone()
+          caches.open(CACHE_NAME).then(cache => cache.put(request, clone))
+        }
         return response
       })
-      .catch(() => caches.match(request).then(r => r || caches.match('/')))
+      .catch(() =>
+        caches.match(request).then(cached => cached || caches.match('/'))
+      )
   )
 })
