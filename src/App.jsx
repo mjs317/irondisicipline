@@ -8,7 +8,10 @@ import {
   exerciseTrendFromSessions,
   sessionDayStreak,
   buildProgramOutline,
-  findSetKeyForExercise
+  findSetKeyForExercise,
+  coachContextColumnError,
+  upsertWorkoutSessionCompat,
+  upsertTodayLogCompat
 } from './trainingUtils'
 import { buildExportPayload, downloadJson, validateImportPayload } from './exportImport'
 
@@ -387,20 +390,6 @@ function normalizeCoachContext(raw) {
   }
 }
 
-/** Postgres/PostgREST: coach_context column not migrated yet */
-function coachContextColumnError(err) {
-  if (!err) return false
-  const s = `${err.message || ''} ${err.details || ''} ${String(err.code || '')}`.toLowerCase()
-  if (!s.includes('coach_context')) return false
-  return s.includes('column') || s.includes('schema') || s.includes('42703') || s.includes('pgrst204') || s.includes('does not exist')
-}
-
-function omitCoachPayloadRow(row) {
-  if (!row || typeof row !== 'object') return row
-  const { coach_context: _omit, ...rest } = row
-  return rest
-}
-
 // ─── APP ───
 
 export default function App() {
@@ -453,10 +442,7 @@ export default function App() {
       const data = pendingSave.current
       pendingSave.current = null
       ;(async () => {
-        let res = await supabase.from('today_log').upsert(data, { onConflict: 'user_id,log_date' })
-        if (res.error && coachContextColumnError(res.error)) {
-          res = await supabase.from('today_log').upsert(omitCoachPayloadRow(data), { onConflict: 'user_id,log_date' })
-        }
+        const res = await upsertTodayLogCompat(supabase, data)
         if (res.error) pendingSave.current = data
       })().catch(() => { pendingSave.current = data })
     }
@@ -550,10 +536,7 @@ export default function App() {
         updated_at: new Date().toISOString()
       }
       try {
-        let res = await supabase.from('today_log').upsert(payload, { onConflict: 'user_id,log_date' })
-        if (res.error && coachContextColumnError(res.error)) {
-          res = await supabase.from('today_log').upsert(omitCoachPayloadRow(payload), { onConflict: 'user_id,log_date' })
-        }
+        const res = await upsertTodayLogCompat(supabase, payload)
         if (res.error) {
           pendingSave.current = payload
           console.error('Auto-save error:', res.error)
@@ -627,11 +610,7 @@ export default function App() {
         metcon_sel: metconSel,
         coach_context: ctx
       }
-      let up = await supabase.from('workout_sessions').upsert(sessionRow, { onConflict: 'user_id,session_date,day_idx,phase' })
-      if (up.error && coachContextColumnError(up.error)) {
-        console.warn('workout_sessions: retrying without coach_context — apply migrations/002_coach_context.sql')
-        up = await supabase.from('workout_sessions').upsert(omitCoachPayloadRow(sessionRow), { onConflict: 'user_id,session_date,day_idx,phase' })
-      }
+      let up = await upsertWorkoutSessionCompat(supabase, sessionRow)
       if (up.error) throw new Error(up.error.message || 'workout_sessions save failed')
 
       const logRow = {
@@ -642,10 +621,7 @@ export default function App() {
         coach_context: ctx,
         updated_at: new Date().toISOString()
       }
-      up = await supabase.from('today_log').upsert(logRow, { onConflict: 'user_id,log_date' })
-      if (up.error && coachContextColumnError(up.error)) {
-        up = await supabase.from('today_log').upsert(omitCoachPayloadRow(logRow), { onConflict: 'user_id,log_date' })
-      }
+      up = await upsertTodayLogCompat(supabase, logRow)
       if (up.error) throw new Error(up.error.message || 'today_log save failed')
 
       const histQ = await supabase.from('workout_sessions').select('*').eq('user_id', USER_ID).order('session_date', { ascending: false }).limit(HISTORY_LIMIT)
@@ -980,10 +956,7 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
         await syncPersonalRecordsToDb(supabase, USER_ID, prFinal)
         for (const row of sessions) {
           const { id: _id, ...rest } = row
-          let up = await supabase.from('workout_sessions').upsert(rest, { onConflict: 'user_id,session_date,day_idx,phase' })
-          if (up.error && coachContextColumnError(up.error)) {
-            up = await supabase.from('workout_sessions').upsert(omitCoachPayloadRow(rest), { onConflict: 'user_id,session_date,day_idx,phase' })
-          }
+          const up = await upsertWorkoutSessionCompat(supabase, rest)
           if (up.error) throw new Error(up.error.message || 'workout_sessions import failed')
         }
         const importLogRow = {
@@ -994,10 +967,7 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
           coach_context: normalizeCoachContext(d.todayLog?.coach_context || {}),
           updated_at: new Date().toISOString()
         }
-        let logUp = await supabase.from('today_log').upsert(importLogRow, { onConflict: 'user_id,log_date' })
-        if (logUp.error && coachContextColumnError(logUp.error)) {
-          logUp = await supabase.from('today_log').upsert(omitCoachPayloadRow(importLogRow), { onConflict: 'user_id,log_date' })
-        }
+        const logUp = await upsertTodayLogCompat(supabase, importLogRow)
         if (logUp.error) throw new Error(logUp.error.message || 'today_log import failed')
       }
       setImportMsg('Imported.')

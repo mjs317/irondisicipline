@@ -137,7 +137,108 @@ export function exerciseTrendFromSessions(sessions, limitPerEx = 5) {
   return byEx
 }
 
-/** Streak of calendar days with at least one session (contiguous ending today or most recent). */
+/** Postgres/PostgREST: coach_context column not migrated yet */
+export function coachContextColumnError(err) {
+  if (!err) return false
+  const s = `${err.message || ''} ${err.details || ''} ${String(err.code || '')}`.toLowerCase()
+  if (!s.includes('coach_context')) return false
+  return s.includes('column') || s.includes('schema') || s.includes('42703') || s.includes('pgrst204') || s.includes('does not exist')
+}
+
+export function omitCoachPayloadRow(row) {
+  if (!row || typeof row !== 'object') return row
+  const { coach_context: _omit, ...rest } = row
+  return rest
+}
+
+/** ON CONFLICT target missing — UNIQUE index/migration not applied on the table. */
+export function onConflictMissingError(err) {
+  if (!err) return false
+  const s = `${err.message || ''} ${err.details || ''}`.toLowerCase()
+  return s.includes('no unique or exclusion constraint matching')
+}
+
+export async function upsertWorkoutSessionCompat(supabase, sessionRow) {
+  const onConflict = 'user_id,session_date,day_idx,phase'
+  let r = await supabase.from('workout_sessions').upsert(sessionRow, { onConflict })
+  if (r.error && coachContextColumnError(r.error)) {
+    console.warn('workout_sessions: retrying without coach_context — apply supabase/migrations/002_coach_context.sql')
+    r = await supabase.from('workout_sessions').upsert(omitCoachPayloadRow(sessionRow), { onConflict })
+  }
+  if (!r.error || !onConflictMissingError(r.error)) return r
+
+  console.warn('workout_sessions: missing UNIQUE for upsert — apply supabase/migrations/001_workout_sessions_phase.sql; using update/insert fallback')
+  const { user_id, session_date, day_idx, phase } = sessionRow
+  const sel = await supabase.from('workout_sessions').select('user_id').eq('user_id', user_id).eq('session_date', session_date).eq('day_idx', day_idx).eq('phase', phase).limit(1)
+  if (sel.error) return sel
+
+  const { user_id: _u, session_date: _sd, day_idx: _di, phase: _ph, ...rest } = sessionRow
+  if (sel.data?.length) {
+    r = await supabase.from('workout_sessions').update(rest).eq('user_id', user_id).eq('session_date', session_date).eq('day_idx', day_idx).eq('phase', phase)
+  } else {
+    r = await supabase.from('workout_sessions').insert(sessionRow)
+  }
+  if (r.error && coachContextColumnError(r.error)) {
+    const row2 = omitCoachPayloadRow(sessionRow)
+    const { user_id: _u2, session_date: _sd2, day_idx: _di2, phase: _ph2, ...rest2 } = row2
+    if (sel.data?.length) {
+      r = await supabase.from('workout_sessions').update(rest2).eq('user_id', user_id).eq('session_date', session_date).eq('day_idx', day_idx).eq('phase', phase)
+    } else {
+      r = await supabase.from('workout_sessions').insert(row2)
+    }
+  }
+  return r
+}
+
+export async function upsertTodayLogCompat(supabase, logRow) {
+  const onConflict = 'user_id,log_date'
+  let r = await supabase.from('today_log').upsert(logRow, { onConflict })
+  if (r.error && coachContextColumnError(r.error)) {
+    r = await supabase.from('today_log').upsert(omitCoachPayloadRow(logRow), { onConflict })
+  }
+  if (!r.error || !onConflictMissingError(r.error)) return r
+
+  console.warn('today_log: missing UNIQUE for upsert — apply supabase/migrations/003_today_log_unique.sql; using update/insert fallback')
+  const { user_id, log_date } = logRow
+  const sel = await supabase.from('today_log').select('user_id').eq('user_id', user_id).eq('log_date', log_date).limit(1)
+  if (sel.error) return sel
+
+  const { user_id: _u, log_date: _ld, ...rest } = logRow
+  if (sel.data?.length) {
+    r = await supabase.from('today_log').update(rest).eq('user_id', user_id).eq('log_date', log_date)
+  } else {
+    r = await supabase.from('today_log').insert(logRow)
+  }
+  if (r.error && coachContextColumnError(r.error)) {
+    const row2 = omitCoachPayloadRow(logRow)
+    const { user_id: _u2, log_date: _ld2, ...rest2 } = row2
+    if (sel.data?.length) {
+      r = await supabase.from('today_log').update(rest2).eq('user_id', user_id).eq('log_date', log_date)
+    } else {
+      r = await supabase.from('today_log').insert(row2)
+    }
+  }
+  return r
+}
+
+async function upsertPersonalRecordRowCompat(supabase, row) {
+  const onConflict = 'user_id,exercise_id'
+  let r = await supabase.from('personal_records').upsert([row], { onConflict })
+  if (!r.error || !onConflictMissingError(r.error)) return r
+
+  const { user_id, exercise_id } = row
+  const sel = await supabase.from('personal_records').select('exercise_id').eq('user_id', user_id).eq('exercise_id', exercise_id).limit(1)
+  if (sel.error) return sel
+
+  const { user_id: _u, exercise_id: _e, ...rest } = row
+  if (sel.data?.length) {
+    r = await supabase.from('personal_records').update(rest).eq('user_id', user_id).eq('exercise_id', exercise_id)
+  } else {
+    r = await supabase.from('personal_records').insert(row)
+  }
+  return r
+}
+
 /** Upsert PR rows from recalculated map; delete DB rows for exercises no longer present. */
 export async function syncPersonalRecordsToDb(supabase, userId, prMap) {
   const ids = Object.keys(prMap)
@@ -148,12 +249,22 @@ export async function syncPersonalRecordsToDb(supabase, userId, prMap) {
     recorded_date: prMap[exercise_id].date
   }))
   if (upserts.length) {
-    await supabase.from('personal_records').upsert(upserts, { onConflict: 'user_id,exercise_id' })
+    let r = await supabase.from('personal_records').upsert(upserts, { onConflict: 'user_id,exercise_id' })
+    if (r.error && onConflictMissingError(r.error)) {
+      console.warn('personal_records: missing UNIQUE for upsert — add unique(user_id, exercise_id); using per-row fallback')
+      for (const row of upserts) {
+        r = await upsertPersonalRecordRowCompat(supabase, row)
+        if (r.error) break
+      }
+    }
+    if (r.error) throw new Error(r.error.message || 'personal_records sync failed')
   }
-  const { data: existing } = await supabase.from('personal_records').select('exercise_id').eq('user_id', userId)
-  const toDelete = (existing || []).map(r => r.exercise_id).filter(eid => !prMap[eid])
+  const { data: existing, error: exErr } = await supabase.from('personal_records').select('exercise_id').eq('user_id', userId)
+  if (exErr) throw new Error(exErr.message || 'personal_records load failed')
+  const toDelete = (existing || []).map(row => row.exercise_id).filter(eid => !prMap[eid])
   if (toDelete.length) {
-    await supabase.from('personal_records').delete().eq('user_id', userId).in('exercise_id', toDelete)
+    const del = await supabase.from('personal_records').delete().eq('user_id', userId).in('exercise_id', toDelete)
+    if (del.error) throw new Error(del.error.message || 'personal_records delete failed')
   }
 }
 
