@@ -377,17 +377,34 @@ function migrateTodayLogPayload(raw) {
   return { hypertrophy: { ...raw }, strength: {} }
 }
 
-const DEFAULT_COACH_CONTEXT = { running: 'normal', sleepHours: '', sleepFeel: 'ok', deload: false, race: false }
+/** Miles + run quality; replaces old low/normal/high “running load” vs lifting. */
+const RUN_TYPES = ['off', 'easy', 'tempo', 'intervals', 'long', 'recovery', 'strides', 'race', 'mixed']
+
+const DEFAULT_COACH_CONTEXT = { runMiles: '', runType: 'off', sleepHours: '', sleepFeel: 'ok', deload: false, race: false }
 
 function normalizeCoachContext(raw) {
   if (!raw || typeof raw !== 'object') return { ...DEFAULT_COACH_CONTEXT }
+  const runMiles = raw.runMiles != null && String(raw.runMiles).trim() !== '' ? String(raw.runMiles).trim() : ''
+  let runType = RUN_TYPES.includes(raw.runType) ? raw.runType : 'off'
+  // Legacy: low/normal/high = coarse fatigue vs weights (not miles). Map into run types when new fields absent.
+  if (!raw.runType && ['low', 'normal', 'high'].includes(raw.running)) {
+    runType = raw.running === 'low' ? 'easy' : raw.running === 'high' ? 'intervals' : 'tempo'
+  }
   return {
-    running: ['low', 'normal', 'high'].includes(raw.running) ? raw.running : 'normal',
+    runMiles,
+    runType,
     sleepHours: raw.sleepHours != null && String(raw.sleepHours).trim() !== '' ? String(raw.sleepHours).trim() : '',
     sleepFeel: ['great', 'good', 'ok', 'poor', 'bad'].includes(raw.sleepFeel) ? raw.sleepFeel : 'ok',
     deload: Boolean(raw.deload),
     race: Boolean(raw.race)
   }
+}
+
+function formatRunContextLine(c) {
+  const mi = String(c.runMiles || '').trim()
+  if (c.runType === 'off' && !mi) return 'no run logged'
+  const dist = mi ? `${mi} mi` : 'distance not specified'
+  return `${dist} · ${c.runType}`
 }
 
 // ─── APP ───
@@ -660,9 +677,9 @@ export default function App() {
   }
 
   const coachContextBlock = () => {
-    const c = coachContext
+    const c = normalizeCoachContext(coachContext)
     const parts = []
-    if (c.running !== 'normal') parts.push(`Running load: ${c.running}`)
+    parts.push(`Run: ${formatRunContextLine(c)}`)
     const hrs = String(c.sleepHours || '').trim()
     parts.push(hrs ? `Hours slept (last night): ${hrs}` : 'Hours slept (last night): not specified')
     parts.push(`Perceived sleep quality: ${c.sleepFeel}`)
@@ -683,7 +700,7 @@ export default function App() {
     let ctxLine = ''
     if (ctx && typeof ctx === 'object') {
       const n = normalizeCoachContext(ctx)
-      ctxLine = `  saved context: run=${n.running}, sleep=${n.sleepHours || '—'}h, feel=${n.sleepFeel}${n.deload ? ', deload' : ''}${n.race ? ', race' : ''}\n`
+      ctxLine = `  saved context: run (${formatRunContextLine(n)}), sleep=${n.sleepHours || '—'}h, feel=${n.sleepFeel}${n.deload ? ', deload' : ''}${n.race ? ', race' : ''}\n`
     }
     return `— ${h.session_date} · ${h.phase} · day ${Number(h.day_idx) + 1} (${h.day_name})\n${ctxLine}${lines.join('\n') || '  (no weights logged)'}`
   }
@@ -1233,10 +1250,22 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
       <div style={S.contextCard}>
         <div style={{ fontSize: 10, fontWeight: 700, color: ACCENT, letterSpacing: 1, marginBottom: 6 }}>SESSION CONTEXT</div>
         <div style={{ fontSize: 10, color: MUTED }}>Set before you save — stored with this workout for AI.</div>
-        <div style={{ ...S.chipRow, marginTop: 8, marginBottom: 0 }}>
-          <span style={{ fontSize: 8, color: MUTED }}>RUN</span>
-          {['low', 'normal', 'high'].map(o => (
-            <button key={o} type="button" style={S.chipBtn(coachContext.running === o)} onClick={() => setCoachContext(x => ({ ...x, running: o }))}>{o}</button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginTop: 8, marginBottom: 4 }}>
+          <span style={{ fontSize: 8, color: MUTED }}>RUN (MI)</span>
+          <input
+            type="text"
+            inputMode="decimal"
+            placeholder="miles"
+            value={coachContext.runMiles ?? ''}
+            onChange={e => setCoachContext(x => ({ ...x, runMiles: e.target.value }))}
+            style={{ ...S.sleepInput, width: 56 }}
+            autoComplete="off"
+          />
+        </div>
+        <div style={{ ...S.chipRow, marginTop: 0, marginBottom: 0, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 8, color: MUTED }}>TYPE</span>
+          {RUN_TYPES.map(o => (
+            <button key={o} type="button" style={S.chipBtn((coachContext.runType ?? 'off') === o)} onClick={() => setCoachContext(x => ({ ...x, runType: o }))}>{o}</button>
           ))}
         </div>
         <div style={S.sleepRow}>
@@ -1448,7 +1477,7 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
       <div style={{ marginBottom: 16 }}>
         <div style={{ fontSize: 14, fontWeight: 700, letterSpacing: 2 }}>AI INSIGHT</div>
         <div style={{ fontSize: 10, color: MUTED, marginTop: 4 }}>
-          Session context comes from the WORKOUT tab (running, sleep hours + how it felt, flags). Each saved workout stores that on the server for richer week reviews.
+          Session context comes from the WORKOUT tab (run miles + type, sleep hours + how it felt, flags). Each saved workout stores that on the server for richer week reviews.
         </div>
       </div>
       <div style={{ display: 'flex', gap: 6, marginBottom: 14, flexWrap: 'wrap' }}>
@@ -1635,7 +1664,7 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
                 const n = normalizeCoachContext(session.coach_context)
                 return (
                   <div style={{ fontSize: 9, color: BLUE, marginTop: 4 }}>
-                    Ctx run:{n.running} sleep:{n.sleepHours || '—'}h {n.sleepFeel}{n.deload ? ' · deload' : ''}{n.race ? ' · race' : ''}
+                    Ctx run: {formatRunContextLine(n)} · sleep:{n.sleepHours || '—'}h {n.sleepFeel}{n.deload ? ' · deload' : ''}{n.race ? ' · race' : ''}
                   </div>
                 )
               })()}

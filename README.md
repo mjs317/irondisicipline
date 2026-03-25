@@ -43,7 +43,7 @@ If your constraint name differs, adjust the `DROP CONSTRAINT` line using the nam
 
 ### `coach_context` on `today_log` and `workout_sessions`
 
-Session form fields (running load, sleep hours, perceived sleep, deload/race flags) are saved as JSON for AI. Apply:
+Session form fields (run miles + run type, sleep hours, perceived sleep, deload/race flags) are saved as JSON for AI. Apply:
 
 `supabase/migrations/002_coach_context.sql`
 
@@ -78,7 +78,7 @@ Then **Get coaching** and **plan week** work from the Vite app. Without `vercel 
 - **Export / import JSON** backup (PRs tab and Stats tab).
 - **STATS** tab: estimated tonnage, session streak, sessions per ISO week, recent best weights per lift.
 - **AI week plan:** suggests working weights from history + PRs; **Apply this day** / **Apply all days** fills weight fields for the current phase.
-- **Session context** on Workout (run load, sleep hours + perceived quality, deload/race); saved as **`coach_context`**. **INSIGHT** tab: analyze this session or last 7 days (JSON + follow-up).
+- **Session context** on Workout (run miles + type, sleep hours + perceived quality, deload/race); saved as **`coach_context`**. **INSIGHT** tab: analyze this session or last 7 days (JSON + follow-up).
 
 ## Build
 
