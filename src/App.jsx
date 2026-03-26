@@ -708,6 +708,18 @@ export default function App() {
           .eq('user_id', USER_ID)
           .eq('log_date', today())
           .maybeSingle()
+        if (todayRes.error) {
+          const msg = `${todayRes.error.message || ''} ${todayRes.error.details || ''}`.toLowerCase()
+          if (msg.includes('updated_at')) {
+            console.warn('today_log: add updated_at — run supabase/migrations/004_today_log_updated_at.sql')
+            todayRes = await supabase
+              .from('today_log')
+              .select('sets_data, metcon_sel, coach_context')
+              .eq('user_id', USER_ID)
+              .eq('log_date', today())
+              .maybeSingle()
+          }
+        }
         if (todayRes.error && coachContextColumnError(todayRes.error)) {
           console.warn('today_log: coach_context column missing — run supabase/migrations/002_coach_context.sql')
           todayRes = await supabase
@@ -716,7 +728,19 @@ export default function App() {
             .eq('user_id', USER_ID)
             .eq('log_date', today())
             .maybeSingle()
-        } else if (todayRes.error) {
+          if (todayRes.error) {
+            const msg = `${todayRes.error.message || ''} ${todayRes.error.details || ''}`.toLowerCase()
+            if (msg.includes('updated_at')) {
+              todayRes = await supabase
+                .from('today_log')
+                .select('sets_data, metcon_sel')
+                .eq('user_id', USER_ID)
+                .eq('log_date', today())
+                .maybeSingle()
+            }
+          }
+        }
+        if (todayRes.error) {
           console.error('today_log load error:', todayRes.error)
         }
 
