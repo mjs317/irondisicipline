@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import React, { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from 'react'
 import { supabase, supabaseReady, USER_ID } from './supabase'
 import {
   recalculatePrsFromSessions,
@@ -19,6 +19,37 @@ const HISTORY_LIMIT = 500
 const LS_PHASE = 'iron_discipline_phase'
 const LS_ACTIVE_DAY = 'iron_discipline_active_day'
 const TODAY_LOG_AUTOSAVE_MS = 1200
+function todayDraftStorageKey() {
+  return `iron_today_draft_${USER_ID}_${today()}`
+}
+
+function readTodayDraft() {
+  try {
+    const s = localStorage.getItem(todayDraftStorageKey())
+    if (!s) return null
+    const d = JSON.parse(s)
+    if (!d || typeof d.savedAt !== 'number') return null
+    return d
+  } catch {
+    return null
+  }
+}
+
+/** Synchronous — use before async network; safe when app is killed mid-request. */
+function writeTodayDraftSync(snap) {
+  if (!snap) return
+  try {
+    localStorage.setItem(
+      todayDraftStorageKey(),
+      JSON.stringify({
+        savedAt: Date.now(),
+        setsByPhase: snap.setsByPhase,
+        metconByPhase: snap.metconByPhase,
+        coachContextBySlot: snap.coachContextBySlot
+      })
+    )
+  } catch (_) { /* quota / private mode */ }
+}
 
 // ─── Colors ───
 const BG      = '#0a0a0a'
@@ -592,6 +623,7 @@ export default function App() {
     if (!supabase) return
     const flush = () => {
       if (!loadedRef.current) return
+      writeTodayDraftSync(latestTodayRef.current)
       if (autoSaveTimer.current) {
         clearTimeout(autoSaveTimer.current)
         autoSaveTimer.current = null
@@ -616,11 +648,17 @@ export default function App() {
     const onVisibility = () => {
       if (document.visibilityState === 'hidden') flush()
     }
+    const onBeforeUnload = () => writeTodayDraftSync(latestTodayRef.current)
+    const onFreeze = () => writeTodayDraftSync(latestTodayRef.current)
     document.addEventListener('visibilitychange', onVisibility)
     window.addEventListener('pagehide', flush)
+    window.addEventListener('beforeunload', onBeforeUnload)
+    document.addEventListener('freeze', onFreeze)
     return () => {
       document.removeEventListener('visibilitychange', onVisibility)
       window.removeEventListener('pagehide', flush)
+      window.removeEventListener('beforeunload', onBeforeUnload)
+      document.removeEventListener('freeze', onFreeze)
     }
   }, [supabase])
 
@@ -664,10 +702,20 @@ export default function App() {
         setPhase(restoredPhase)
         setActiveDay(restoredDay)
 
-        let todayRes = await supabase.from('today_log').select('sets_data, metcon_sel, coach_context').eq('user_id', USER_ID).eq('log_date', today()).maybeSingle()
+        let todayRes = await supabase
+          .from('today_log')
+          .select('sets_data, metcon_sel, coach_context, updated_at')
+          .eq('user_id', USER_ID)
+          .eq('log_date', today())
+          .maybeSingle()
         if (todayRes.error && coachContextColumnError(todayRes.error)) {
           console.warn('today_log: coach_context column missing — run supabase/migrations/002_coach_context.sql')
-          todayRes = await supabase.from('today_log').select('sets_data, metcon_sel').eq('user_id', USER_ID).eq('log_date', today()).maybeSingle()
+          todayRes = await supabase
+            .from('today_log')
+            .select('sets_data, metcon_sel, updated_at')
+            .eq('user_id', USER_ID)
+            .eq('log_date', today())
+            .maybeSingle()
         } else if (todayRes.error) {
           console.error('today_log load error:', todayRes.error)
         }
@@ -680,6 +728,20 @@ export default function App() {
               parseCoachContextSlotsFromDb(todayRes.data.coach_context, restoredPhase, restoredDay)
             )
           } else setCoachContextBySlot({})
+        }
+
+        let serverTs = 0
+        if (todayRes.data?.updated_at) {
+          const t = new Date(todayRes.data.updated_at).getTime()
+          if (Number.isFinite(t)) serverTs = t
+        }
+        const draft = readTodayDraft()
+        if (draft?.savedAt != null && draft.savedAt > serverTs) {
+          if (draft.setsByPhase) setSetsByPhase(migrateTodayLogPayload(draft.setsByPhase))
+          if (draft.metconByPhase) setMetconByPhase(migrateTodayLogPayload(draft.metconByPhase))
+          if (draft.coachContextBySlot && typeof draft.coachContextBySlot === 'object') {
+            setCoachContextBySlot(draft.coachContextBySlot)
+          }
         }
       } catch (e) {
         console.error('Load error:', e)
@@ -722,6 +784,12 @@ export default function App() {
     }, TODAY_LOG_AUTOSAVE_MS)
     return () => { if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current) }
   }, [setsByPhase, metconByPhase, coachContextBySlot, loaded, supabase])
+
+  // ─── Local draft backup — runs sync after commit (narrow window vs hard kill) ───
+  useLayoutEffect(() => {
+    if (!loaded) return
+    writeTodayDraftSync(latestTodayRef.current)
+  }, [setsByPhase, metconByPhase, coachContextBySlot, loaded])
 
   // ─── Scroll to top on tab/day change ───
   useEffect(() => {
