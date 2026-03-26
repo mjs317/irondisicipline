@@ -16,6 +16,9 @@ import {
 import { buildExportPayload, downloadJson, validateImportPayload } from './exportImport'
 
 const HISTORY_LIMIT = 500
+const LS_PHASE = 'iron_discipline_phase'
+const LS_ACTIVE_DAY = 'iron_discipline_active_day'
+const TODAY_LOG_AUTOSAVE_MS = 1200
 
 // ─── Colors ───
 const BG      = '#0a0a0a'
@@ -368,6 +371,35 @@ const STRENGTH = [
 
 const PHASES = { hypertrophy: HYPERTROPHY, strength: STRENGTH }
 
+function clampDayIndex(phaseKey, dayIdx) {
+  const max = PHASES[phaseKey].length - 1
+  const d = Number(dayIdx)
+  if (!Number.isFinite(d) || d < 0) return 0
+  return Math.min(d, max)
+}
+
+/** Prefer phase/day from workouts saved today, then localStorage. */
+function resolvePhaseAndDayFromHistory(histRows) {
+  const todayStr = today()
+  const rows = (histRows || []).filter(h => h.session_date === todayStr)
+  if (rows.length) {
+    const sorted = [...rows].sort((a, b) => {
+      const ua = String(a.updated_at || a.created_at || '')
+      const ub = String(b.updated_at || b.created_at || '')
+      if (ub !== ua) return ub.localeCompare(ua)
+      return String(b.id || '').localeCompare(String(a.id || ''))
+    })
+    const pick = sorted[0]
+    const ph = pick.phase === 'strength' ? 'strength' : 'hypertrophy'
+    return { phase: ph, activeDay: clampDayIndex(ph, pick.day_idx) }
+  }
+  const p = localStorage.getItem(LS_PHASE)
+  const ph = p === 'strength' ? 'strength' : 'hypertrophy'
+  const dRaw = localStorage.getItem(LS_ACTIVE_DAY)
+  const d = dRaw != null ? Number(dRaw) : 0
+  return { phase: ph, activeDay: clampDayIndex(ph, d) }
+}
+
 /** Migrate flat JSON from older today_log rows into per-phase buckets. */
 function migrateTodayLogPayload(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { hypertrophy: {}, strength: {} }
@@ -438,6 +470,13 @@ export default function App() {
   const autoSaveTimer = useRef(null)
   const pendingSave = useRef(null)
   const scrollRef = useRef(null)
+  const loadedRef = useRef(false)
+  /** Latest snapshot for flush / races — updated every render */
+  const latestTodayRef = useRef({ setsByPhase, metconByPhase, coachContext })
+  /** Incremented on each today_log write; stale completions must not clobber newer state. */
+  const todayLogWriteGen = useRef(0)
+
+  latestTodayRef.current = { setsByPhase, metconByPhase, coachContext }
 
   const days = PHASES[phase]
   const dayData = days[activeDay]
@@ -485,6 +524,60 @@ export default function App() {
     return () => el.removeEventListener('scroll', onScroll)
   }, [loaded])
 
+  useEffect(() => {
+    loadedRef.current = loaded
+  }, [loaded])
+
+  useEffect(() => {
+    if (!loaded) return
+    try {
+      localStorage.setItem(LS_PHASE, phase)
+      localStorage.setItem(LS_ACTIVE_DAY, String(activeDay))
+    } catch (_) { /* private mode */ }
+  }, [phase, activeDay, loaded])
+
+  useEffect(() => {
+    const max = PHASES[phase].length - 1
+    if (activeDay > max) setActiveDay(max)
+  }, [phase, activeDay])
+
+  // ─── Flush today_log when app backgrounded or closed (mobile PWA) ───
+  useEffect(() => {
+    if (!supabase) return
+    const flush = () => {
+      if (!loadedRef.current) return
+      if (autoSaveTimer.current) {
+        clearTimeout(autoSaveTimer.current)
+        autoSaveTimer.current = null
+      }
+      const snap = latestTodayRef.current
+      const payload = {
+        user_id: USER_ID,
+        log_date: today(),
+        sets_data: snap.setsByPhase,
+        metcon_sel: snap.metconByPhase,
+        coach_context: normalizeCoachContext(snap.coachContext),
+        updated_at: new Date().toISOString()
+      }
+      const gen = ++todayLogWriteGen.current
+      void (async () => {
+        const res = await upsertTodayLogCompat(supabase, payload)
+        if (gen !== todayLogWriteGen.current) return
+        if (res.error) pendingSave.current = payload
+        else pendingSave.current = null
+      })()
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') flush()
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    window.addEventListener('pagehide', flush)
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility)
+      window.removeEventListener('pagehide', flush)
+    }
+  }, [supabase])
+
   // ─── Load data on mount ───
   useEffect(() => {
     if (!supabase) { setLoaded(true); return }
@@ -519,6 +612,12 @@ export default function App() {
           }
         }
 
+        const { phase: restoredPhase, activeDay: restoredDay } = resolvePhaseAndDayFromHistory(
+          !histRes.error ? histRes.data : null
+        )
+        setPhase(restoredPhase)
+        setActiveDay(restoredDay)
+
         let todayRes = await supabase.from('today_log').select('sets_data, metcon_sel, coach_context').eq('user_id', USER_ID).eq('log_date', today()).maybeSingle()
         if (todayRes.error && coachContextColumnError(todayRes.error)) {
           console.warn('today_log: coach_context column missing — run supabase/migrations/002_coach_context.sql')
@@ -530,7 +629,7 @@ export default function App() {
         if (todayRes.data) {
           if (todayRes.data.sets_data) setSetsByPhase(migrateTodayLogPayload(todayRes.data.sets_data))
           if (todayRes.data.metcon_sel) setMetconByPhase(migrateTodayLogPayload(todayRes.data.metcon_sel))
-          if (todayRes.data.coach_context) setCoachContext(normalizeCoachContext(todayRes.data.coach_context))
+          setCoachContext(normalizeCoachContext(todayRes.data.coach_context ?? {}))
         }
       } catch (e) {
         console.error('Load error:', e)
@@ -539,34 +638,40 @@ export default function App() {
     })()
   }, [])
 
-  // ─── Auto-save today log on changes ───
+  // ─── Auto-save today log on changes (debounced; stale writes ignored via todayLogWriteGen) ───
   useEffect(() => {
     if (!loaded || !supabase) return
     if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
-    autoSaveTimer.current = setTimeout(async () => {
+    autoSaveTimer.current = setTimeout(() => {
+      const snap = latestTodayRef.current
       const payload = {
         user_id: USER_ID,
         log_date: today(),
-        sets_data: setsByPhase,
-        metcon_sel: metconByPhase,
-        coach_context: normalizeCoachContext(coachContext),
+        sets_data: snap.setsByPhase,
+        metcon_sel: snap.metconByPhase,
+        coach_context: normalizeCoachContext(snap.coachContext),
         updated_at: new Date().toISOString()
       }
-      try {
-        const res = await upsertTodayLogCompat(supabase, payload)
-        if (res.error) {
+      const gen = ++todayLogWriteGen.current
+      void (async () => {
+        try {
+          const res = await upsertTodayLogCompat(supabase, payload)
+          if (gen !== todayLogWriteGen.current) return
+          if (res.error) {
+            pendingSave.current = payload
+            console.error('Auto-save error:', res.error)
+          } else {
+            pendingSave.current = null
+          }
+        } catch (e) {
+          if (gen !== todayLogWriteGen.current) return
           pendingSave.current = payload
-          console.error('Auto-save error:', res.error)
-        } else {
-          pendingSave.current = null
+          console.error('Auto-save error:', e)
         }
-      } catch (e) {
-        pendingSave.current = payload
-        console.error('Auto-save error:', e)
-      }
-    }, 2000)
+      })()
+    }, TODAY_LOG_AUTOSAVE_MS)
     return () => { if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current) }
-  }, [setsByPhase, metconByPhase, coachContext, loaded])
+  }, [setsByPhase, metconByPhase, coachContext, loaded, supabase])
 
   // ─── Scroll to top on tab/day change ───
   useEffect(() => {
@@ -614,17 +719,24 @@ export default function App() {
   // ─── Save workout ───
   const saveWorkout = async () => {
     if (!supabase) { setSaveMsg('ERR: DB not configured'); setTimeout(() => setSaveMsg(''), 3000); return }
+    if (!dayData) { setSaveMsg('ERR: No day selected'); setTimeout(() => setSaveMsg(''), 3000); return }
     setSaveMsg('SAVING...')
+    if (autoSaveTimer.current) {
+      clearTimeout(autoSaveTimer.current)
+      autoSaveTimer.current = null
+    }
+    todayLogWriteGen.current++
     try {
-      const ctx = normalizeCoachContext(coachContext)
+      const snap = latestTodayRef.current
+      const ctx = normalizeCoachContext(snap.coachContext)
       const sessionRow = {
         user_id: USER_ID,
         session_date: today(),
         day_idx: activeDay,
         day_name: dayData.name,
         phase,
-        sets_data: sets,
-        metcon_sel: metconSel,
+        sets_data: snap.setsByPhase[phase] || {},
+        metcon_sel: snap.metconByPhase[phase] || {},
         coach_context: ctx
       }
       let up = await upsertWorkoutSessionCompat(supabase, sessionRow)
@@ -633,8 +745,8 @@ export default function App() {
       const logRow = {
         user_id: USER_ID,
         log_date: today(),
-        sets_data: setsByPhase,
-        metcon_sel: metconByPhase,
+        sets_data: snap.setsByPhase,
+        metcon_sel: snap.metconByPhase,
         coach_context: ctx,
         updated_at: new Date().toISOString()
       }
@@ -1236,7 +1348,15 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
   }
 
   // ─── RENDER: WORKOUT TAB ───
-  const renderWorkout = () => (
+  const renderWorkout = () => {
+    if (!dayData) {
+      return (
+        <div style={{ padding: 16, color: MUTED, fontSize: 11, lineHeight: 1.5, fontFamily: FONT }}>
+          No template for this day index. Tap another day (1–4) or switch phase — hypertrophy vs strength use separate logs; the app reopens on the phase you last saved for <strong style={{ color: TEXT }}>today</strong>.
+        </div>
+      )
+    }
+    return (
     <>
       <div style={S.daySelector}>
         {days.map((d, i) => (
@@ -1493,7 +1613,8 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
         )}
       </div>
     </>
-  )
+    )
+  }
 
   // ─── RENDER: INSIGHT TAB (AI) ───
   const renderInsights = () => (
