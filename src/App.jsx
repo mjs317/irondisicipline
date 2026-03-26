@@ -439,6 +439,37 @@ function formatRunContextLine(c) {
   return `${dist} · ${c.runType}`
 }
 
+/** Session context is per program phase + day index, not shared across day tabs. */
+function coachSlotKey(phase, dayIdx) {
+  const ph = phase === 'strength' ? 'strength' : 'hypertrophy'
+  return `${ph}:${clampDayIndex(ph, dayIdx)}`
+}
+
+/** DB shape: { slots: { 'hypertrophy:0': {...}, ... }, v: 1 }. Legacy: single flat object → one slot. */
+function parseCoachContextSlotsFromDb(raw, legacyPhase, legacyDay) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  if (Object.keys(raw).length === 0) return {}
+  if (raw.slots && typeof raw.slots === 'object' && !Array.isArray(raw.slots)) {
+    const out = {}
+    for (const [k, v] of Object.entries(raw.slots)) {
+      if (v && typeof v === 'object') out[k] = normalizeCoachContext(v)
+    }
+    return out
+  }
+  const k = coachSlotKey(legacyPhase, legacyDay)
+  return { [k]: normalizeCoachContext(raw) }
+}
+
+function serializeCoachContextForDb(slotsMap) {
+  if (!slotsMap || typeof slotsMap !== 'object') return { slots: {}, v: 1 }
+  const slots = {}
+  for (const [k, v] of Object.entries(slotsMap)) {
+    if (!v || typeof v !== 'object') continue
+    slots[k] = normalizeCoachContext(v)
+  }
+  return { slots, v: 1 }
+}
+
 // ─── APP ───
 
 export default function App() {
@@ -457,7 +488,8 @@ export default function App() {
   const [lastCoachMsg, setLastCoachMsg] = useState('')
   const [followUp, setFollowUp] = useState('')
   const [insightScope, setInsightScope] = useState('session')
-  const [coachContext, setCoachContext] = useState(() => ({ ...DEFAULT_COACH_CONTEXT }))
+  /** Map slot key `${phase}:${dayIdx}` → coach fields (each program day has its own session context). */
+  const [coachContextBySlot, setCoachContextBySlot] = useState({})
   const [planLoading, setPlanLoading] = useState(false)
   const [planError, setPlanError] = useState('')
   const [planData, setPlanData] = useState(null)
@@ -472,11 +504,25 @@ export default function App() {
   const scrollRef = useRef(null)
   const loadedRef = useRef(false)
   /** Latest snapshot for flush / races — updated every render */
-  const latestTodayRef = useRef({ setsByPhase, metconByPhase, coachContext })
+  const latestTodayRef = useRef({ setsByPhase, metconByPhase, coachContextBySlot })
   /** Incremented on each today_log write; stale completions must not clobber newer state. */
   const todayLogWriteGen = useRef(0)
 
-  latestTodayRef.current = { setsByPhase, metconByPhase, coachContext }
+  latestTodayRef.current = { setsByPhase, metconByPhase, coachContextBySlot }
+
+  const setCoachContext = useCallback((updater) => {
+    setCoachContextBySlot(prev => {
+      const key = coachSlotKey(phase, activeDay)
+      const cur = normalizeCoachContext(prev[key] ?? {})
+      const nextVal = typeof updater === 'function' ? updater({ ...cur }) : { ...cur, ...updater }
+      return { ...prev, [key]: normalizeCoachContext(nextVal) }
+    })
+  }, [phase, activeDay])
+
+  const coachContext = useMemo(
+    () => normalizeCoachContext(coachContextBySlot[coachSlotKey(phase, activeDay)] ?? {}),
+    [coachContextBySlot, phase, activeDay]
+  )
 
   const days = PHASES[phase]
   const dayData = days[activeDay]
@@ -556,7 +602,7 @@ export default function App() {
         log_date: today(),
         sets_data: snap.setsByPhase,
         metcon_sel: snap.metconByPhase,
-        coach_context: normalizeCoachContext(snap.coachContext),
+        coach_context: serializeCoachContextForDb(snap.coachContextBySlot),
         updated_at: new Date().toISOString()
       }
       const gen = ++todayLogWriteGen.current
@@ -629,7 +675,11 @@ export default function App() {
         if (todayRes.data) {
           if (todayRes.data.sets_data) setSetsByPhase(migrateTodayLogPayload(todayRes.data.sets_data))
           if (todayRes.data.metcon_sel) setMetconByPhase(migrateTodayLogPayload(todayRes.data.metcon_sel))
-          setCoachContext(normalizeCoachContext(todayRes.data.coach_context ?? {}))
+          if (todayRes.data.coach_context != null && typeof todayRes.data.coach_context === 'object') {
+            setCoachContextBySlot(
+              parseCoachContextSlotsFromDb(todayRes.data.coach_context, restoredPhase, restoredDay)
+            )
+          } else setCoachContextBySlot({})
         }
       } catch (e) {
         console.error('Load error:', e)
@@ -649,7 +699,7 @@ export default function App() {
         log_date: today(),
         sets_data: snap.setsByPhase,
         metcon_sel: snap.metconByPhase,
-        coach_context: normalizeCoachContext(snap.coachContext),
+        coach_context: serializeCoachContextForDb(snap.coachContextBySlot),
         updated_at: new Date().toISOString()
       }
       const gen = ++todayLogWriteGen.current
@@ -671,7 +721,7 @@ export default function App() {
       })()
     }, TODAY_LOG_AUTOSAVE_MS)
     return () => { if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current) }
-  }, [setsByPhase, metconByPhase, coachContext, loaded, supabase])
+  }, [setsByPhase, metconByPhase, coachContextBySlot, loaded, supabase])
 
   // ─── Scroll to top on tab/day change ───
   useEffect(() => {
@@ -728,7 +778,8 @@ export default function App() {
     todayLogWriteGen.current++
     try {
       const snap = latestTodayRef.current
-      const ctx = normalizeCoachContext(snap.coachContext)
+      const slotK = coachSlotKey(phase, activeDay)
+      const ctx = normalizeCoachContext(snap.coachContextBySlot[slotK] ?? {})
       const sessionRow = {
         user_id: USER_ID,
         session_date: today(),
@@ -747,7 +798,7 @@ export default function App() {
         log_date: today(),
         sets_data: snap.setsByPhase,
         metcon_sel: snap.metconByPhase,
-        coach_context: ctx,
+        coach_context: serializeCoachContextForDb(snap.coachContextBySlot),
         updated_at: new Date().toISOString()
       }
       up = await upsertTodayLogCompat(supabase, logRow)
@@ -789,7 +840,7 @@ export default function App() {
   }
 
   const coachContextBlock = () => {
-    const c = normalizeCoachContext(coachContext)
+    const c = coachContext
     const parts = []
     parts.push(`Run: ${formatRunContextLine(c)}`)
     const hrs = String(c.sleepHours || '').trim()
@@ -1053,7 +1104,7 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
       setsByPhase,
       metconByPhase,
       logDate: today(),
-      coachContext: normalizeCoachContext(coachContext)
+      coachContext: serializeCoachContextForDb(coachContextBySlot)
     })
     downloadJson(payload)
   }
@@ -1079,7 +1130,8 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
       setPrs(prFinal)
       if (d.todayLog?.sets_data) setSetsByPhase(migrateTodayLogPayload(d.todayLog.sets_data))
       if (d.todayLog?.metcon_sel) setMetconByPhase(migrateTodayLogPayload(d.todayLog.metcon_sel))
-      if (d.todayLog?.coach_context) setCoachContext(normalizeCoachContext(d.todayLog.coach_context))
+      const importedSlots = parseCoachContextSlotsFromDb(d.todayLog?.coach_context ?? {}, phase, activeDay)
+      setCoachContextBySlot(importedSlots)
 
       if (supabase) {
         await syncPersonalRecordsToDb(supabase, USER_ID, prFinal)
@@ -1093,9 +1145,9 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
           log_date: today(),
           sets_data: migrateTodayLogPayload(d.todayLog?.sets_data || {}),
           metcon_sel: migrateTodayLogPayload(d.todayLog?.metcon_sel || {}),
-          coach_context: normalizeCoachContext(d.todayLog?.coach_context || {}),
+          coach_context: serializeCoachContextForDb(importedSlots),
           updated_at: new Date().toISOString()
-        }
+           }
         const logUp = await upsertTodayLogCompat(supabase, importLogRow)
         if (logUp.error) throw new Error(logUp.error.message || 'today_log import failed')
       }
@@ -1377,7 +1429,7 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
       <div style={S.contextCard}>
         <div style={{ marginBottom: 10 }}>
           <div style={{ fontSize: 10, fontWeight: 700, color: ACCENT, letterSpacing: 1, marginBottom: 4 }}>SESSION CONTEXT</div>
-          <div style={{ fontSize: 10, color: MUTED, lineHeight: 1.4 }}>Set before you save — stored with this workout for AI.</div>
+          <div style={{ fontSize: 10, color: MUTED, lineHeight: 1.4 }}>Set before you save — stored per <strong style={{ color: TEXT }}>this program day</strong> (day {activeDay + 1} · {phase}) for AI; other days keep their own.</div>
         </div>
 
         <div style={S.contextField}>
