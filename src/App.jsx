@@ -536,7 +536,27 @@ function serializeCoachContextForDb(slotsMap) {
   return { slots, v: 1 }
 }
 
-/** Full day aggregate + current slot session (so history/PRs stay in sync without a manual save). */
+/** Check if any exercise key with the given prefix has actual data entered. */
+function dayHasData(phaseData, dayPrefix) {
+  if (!phaseData || typeof phaseData !== 'object') return false
+  for (const [key, sets] of Object.entries(phaseData)) {
+    if (!key.startsWith(dayPrefix)) continue
+    if (Array.isArray(sets) && sets.some(s => s.weight || s.reps)) return true
+  }
+  return false
+}
+
+/** Return only entries whose keys start with the given prefix. */
+function filterByDayPrefix(data, dayPrefix) {
+  if (!data || typeof data !== 'object') return {}
+  const result = {}
+  for (const [key, val] of Object.entries(data)) {
+    if (key.startsWith(dayPrefix)) result[key] = val
+  }
+  return result
+}
+
+/** Full day aggregate + per-day session rows (so history/PRs stay in sync without a manual save). */
 async function persistTodayToSupabase(supabaseClient, snap, ui) {
   const logRow = {
     user_id: USER_ID,
@@ -549,21 +569,35 @@ async function persistTodayToSupabase(supabaseClient, snap, ui) {
   const logRes = await upsertTodayLogCompat(supabaseClient, logRow)
   if (logRes.error) return logRes
 
-  if (ui?.dayData) {
-    const slotK = coachSlotKey(ui.phase, ui.activeDay)
+  // Upsert a workout_sessions row for each program day that has data
+  const phaseKey = ui?.phase || 'hypertrophy'
+  const phaseDays = PHASES[phaseKey] || []
+  const phaseData = snap.setsByPhase[phaseKey] || {}
+  const phaseMetcon = snap.metconByPhase[phaseKey] || {}
+
+  const upsertPromises = []
+  for (let dayIdx = 0; dayIdx < phaseDays.length; dayIdx++) {
+    const prefix = `d${dayIdx + 1}_`
+    if (!dayHasData(phaseData, prefix)) continue
+    const slotK = coachSlotKey(phaseKey, dayIdx)
     const ctx = normalizeCoachContext(snap.coachContextBySlot[slotK] ?? {})
     const sessionRow = {
       user_id: USER_ID,
       session_date: today(),
-      day_idx: ui.activeDay,
-      day_name: ui.dayData.name,
-      phase: ui.phase,
-      sets_data: snap.setsByPhase[ui.phase] || {},
-      metcon_sel: snap.metconByPhase[ui.phase] || {},
+      day_idx: dayIdx,
+      day_name: phaseDays[dayIdx].name,
+      phase: phaseKey,
+      sets_data: filterByDayPrefix(phaseData, prefix),
+      metcon_sel: filterByDayPrefix(phaseMetcon, prefix),
       coach_context: ctx
     }
-    const sRes = await upsertWorkoutSessionCompat(supabaseClient, sessionRow)
-    if (sRes.error) return sRes
+    upsertPromises.push(upsertWorkoutSessionCompat(supabaseClient, sessionRow))
+  }
+
+  if (upsertPromises.length) {
+    const results = await Promise.all(upsertPromises)
+    const firstError = results.find(r => r.error)
+    if (firstError) return firstError
   }
   return { error: null }
 }
@@ -869,34 +903,48 @@ export default function App() {
           } else setCoachContextBySlot({})
         }
 
-        // ─── Fallback: no today_log for today → restore from recent workout_sessions ───
-        if (!todayRes.data && histRes.data?.length) {
-          const yesterday = (() => {
-            const d = new Date(); d.setDate(d.getDate() - 1)
-            return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0')
-          })()
-          const candidateDates = [today(), yesterday]
-          const recentByPhase = {}
-          for (const row of histRes.data) {
-            const ph = row.phase || 'hypertrophy'
-            if (!recentByPhase[ph] && row.sets_data && typeof row.sets_data === 'object' && Object.keys(row.sets_data).length > 0 && candidateDates.includes(row.session_date)) {
-              recentByPhase[ph] = row
+        // ─── Merge recent workout_sessions for ALL program days into setsByPhase ───
+        // This fills in Days 1-3 data from previous sessions even when today_log only has Day 4.
+        if (histRes.data?.length) {
+          for (const ph of ['hypertrophy', 'strength']) {
+            const recentByDay = {}
+            for (const row of histRes.data) {
+              if ((row.phase || 'hypertrophy') !== ph) continue
+              if (recentByDay[row.day_idx] != null) continue
+              if (row.sets_data && typeof row.sets_data === 'object' && Object.keys(row.sets_data).length > 0) {
+                recentByDay[row.day_idx] = row
+              }
             }
-          }
-          const restored = { hypertrophy: {}, strength: {} }
-          const restoredCtx = {}
-          let didRestore = false
-          for (const [ph, row] of Object.entries(recentByPhase)) {
-            restored[ph] = row.sets_data
-            didRestore = true
-            if (row.coach_context && typeof row.coach_context === 'object') {
-              const slotK = coachSlotKey(ph, row.day_idx ?? 0)
-              restoredCtx[slotK] = normalizeCoachContext(row.coach_context)
-            }
-          }
-          if (didRestore) {
-            setSetsByPhase(prev => ({ ...prev, ...restored }))
-            if (Object.keys(restoredCtx).length) setCoachContextBySlot(restoredCtx)
+            if (!Object.keys(recentByDay).length) continue
+
+            setSetsByPhase(prev => {
+              const cur = { ...(prev[ph] || {}) }
+              let changed = false
+              for (const row of Object.values(recentByDay)) {
+                for (const [key, val] of Object.entries(row.sets_data)) {
+                  if (!cur[key] || !Array.isArray(cur[key]) || !cur[key].some(s => s.weight || s.reps)) {
+                    cur[key] = val
+                    changed = true
+                  }
+                }
+              }
+              return changed ? { ...prev, [ph]: cur } : prev
+            })
+
+            setCoachContextBySlot(prev => {
+              const next = { ...prev }
+              let changed = false
+              for (const [dayIdx, row] of Object.entries(recentByDay)) {
+                if (row.coach_context && typeof row.coach_context === 'object') {
+                  const slotK = coachSlotKey(ph, Number(dayIdx))
+                  if (!next[slotK]) {
+                    next[slotK] = normalizeCoachContext(row.coach_context)
+                    changed = true
+                  }
+                }
+              }
+              return changed ? next : prev
+            })
           }
         }
 
