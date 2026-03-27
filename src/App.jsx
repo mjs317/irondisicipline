@@ -36,6 +36,40 @@ function readTodayDraft() {
   }
 }
 
+/** Read the most recent draft across date boundaries (handles midnight rollover). */
+function readRecentDraft() {
+  const todayDraft = readTodayDraft()
+  if (todayDraft) return todayDraft
+  const prefix = `iron_today_draft_${USER_ID}_`
+  let best = null
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i)
+      if (key && key.startsWith(prefix)) {
+        const d = JSON.parse(localStorage.getItem(key))
+        if (d && typeof d.savedAt === 'number' && (!best || d.savedAt > best.savedAt)) {
+          best = d
+        }
+      }
+    }
+  } catch { /* ignore */ }
+  return best
+}
+
+/** Remove draft keys older than today to prevent stale accumulation. */
+function cleanOldDraftKeys() {
+  const prefix = `iron_today_draft_${USER_ID}_`
+  const todayKey = todayDraftStorageKey()
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const key = localStorage.key(i)
+      if (key && key.startsWith(prefix) && key !== todayKey) {
+        localStorage.removeItem(key)
+      }
+    }
+  } catch { /* ignore */ }
+}
+
 /** Synchronous — use before async network; safe when app is killed mid-request. */
 function writeTodayDraftSync(snap) {
   if (!snap) return
@@ -562,6 +596,7 @@ export default function App() {
   const [noteOpen, setNoteOpen] = useState({})
   const [online, setOnline] = useState(navigator.onLine)
   const [pressed, setPressed] = useState(null)
+  const [saveStatus, setSaveStatus] = useState('saved') // 'saved' | 'saving' | 'error' | 'offline'
   const pendingSave = useRef(null)
   const scrollRef = useRef(null)
   const loadedRef = useRef(false)
@@ -571,6 +606,8 @@ export default function App() {
   const persistTailRef = useRef(Promise.resolve())
   const autosaveDebounceRef = useRef(null)
   const historyRefreshTimerRef = useRef(null)
+  /** Skip the very first autosave trigger after load (prevents writing empty/stale state). */
+  const initialLoadSkipRef = useRef(true)
   /** Phase / day / template for workout_sessions row at persist time */
   const workoutUiRef = useRef({ phase: 'hypertrophy', activeDay: 0, dayData: null })
 
@@ -598,8 +635,8 @@ export default function App() {
 
   // ─── Online/offline tracking ───
   useEffect(() => {
-    const on = () => setOnline(true)
-    const off = () => setOnline(false)
+    const on = () => { setOnline(true); setSaveStatus(prev => prev === 'offline' ? 'saved' : prev) }
+    const off = () => { setOnline(false); setSaveStatus('offline') }
     window.addEventListener('online', on)
     window.addEventListener('offline', off)
     return () => { window.removeEventListener('online', on); window.removeEventListener('offline', off) }
@@ -612,10 +649,27 @@ export default function App() {
       pendingSave.current = null
       ;(async () => {
         const res = await persistTodayToSupabase(supabase, pending.snap, pending.ui)
-        if (res.error) pendingSave.current = pending
+        if (res.error) { pendingSave.current = pending; setSaveStatus('error') }
+        else setSaveStatus('saved')
       })().catch(() => { pendingSave.current = pending })
     }
   }, [online])
+
+  // ─── Retry on save error (5s timer, supplements online-reconnect retry) ───
+  useEffect(() => {
+    if (saveStatus !== 'error' || !pendingSave.current || !supabase) return
+    const timer = setTimeout(async () => {
+      const pending = pendingSave.current
+      if (!pending) return
+      pendingSave.current = null
+      try {
+        const res = await persistTodayToSupabase(supabase, pending.snap, pending.ui)
+        if (res.error) { pendingSave.current = pending; setSaveStatus('error') }
+        else setSaveStatus('saved')
+      } catch { pendingSave.current = pending }
+    }, 5000)
+    return () => clearTimeout(timer)
+  }, [saveStatus, supabase])
 
   // ─── Dismiss keyboard on scroll ───
   useEffect(() => {
@@ -654,12 +708,42 @@ export default function App() {
     if (activeDay > max) setActiveDay(max)
   }, [phase, activeDay])
 
+  // ─── Keepalive persist: survives page destruction on mobile ───
+  const beaconPersist = useCallback((snap) => {
+    if (!supabaseReady || !snap) return
+    const url = import.meta.env.VITE_SUPABASE_URL
+    const key = import.meta.env.VITE_SUPABASE_ANON_KEY
+    if (!url || !key) return
+    const logRow = {
+      user_id: USER_ID,
+      log_date: today(),
+      sets_data: snap.setsByPhase,
+      metcon_sel: snap.metconByPhase,
+      coach_context: serializeCoachContextForDb(snap.coachContextBySlot),
+      updated_at: new Date().toISOString()
+    }
+    try {
+      fetch(`${url}/rest/v1/today_log`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'apikey': key,
+          'Authorization': `Bearer ${key}`,
+          'Prefer': 'resolution=merge-duplicates'
+        },
+        body: JSON.stringify(logRow),
+        keepalive: true
+      }).catch(() => {})
+    } catch { /* ignore */ }
+  }, [])
+
   // ─── Flush when app backgrounded or closed (mobile PWA) ───
   useEffect(() => {
     if (!supabase) return
     const flush = () => {
       if (!loadedRef.current) return
       writeTodayDraftSync(latestTodayRef.current)
+      beaconPersist(latestTodayRef.current)
       if (autosaveDebounceRef.current) {
         clearTimeout(autosaveDebounceRef.current)
         autosaveDebounceRef.current = null
@@ -676,7 +760,10 @@ export default function App() {
     const onVisibility = () => {
       if (document.visibilityState === 'hidden') flush()
     }
-    const onBeforeUnload = () => writeTodayDraftSync(latestTodayRef.current)
+    const onBeforeUnload = () => {
+      writeTodayDraftSync(latestTodayRef.current)
+      beaconPersist(latestTodayRef.current)
+    }
     const onFreeze = () => writeTodayDraftSync(latestTodayRef.current)
     document.addEventListener('visibilitychange', onVisibility)
     window.addEventListener('pagehide', flush)
@@ -782,12 +869,44 @@ export default function App() {
           } else setCoachContextBySlot({})
         }
 
+        // ─── Fallback: no today_log for today → restore from recent workout_sessions ───
+        if (!todayRes.data && histRes.data?.length) {
+          const yesterday = (() => {
+            const d = new Date(); d.setDate(d.getDate() - 1)
+            return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0')
+          })()
+          const candidateDates = [today(), yesterday]
+          const recentByPhase = {}
+          for (const row of histRes.data) {
+            const ph = row.phase || 'hypertrophy'
+            if (!recentByPhase[ph] && row.sets_data && typeof row.sets_data === 'object' && Object.keys(row.sets_data).length > 0 && candidateDates.includes(row.session_date)) {
+              recentByPhase[ph] = row
+            }
+          }
+          const restored = { hypertrophy: {}, strength: {} }
+          const restoredCtx = {}
+          let didRestore = false
+          for (const [ph, row] of Object.entries(recentByPhase)) {
+            restored[ph] = row.sets_data
+            didRestore = true
+            if (row.coach_context && typeof row.coach_context === 'object') {
+              const slotK = coachSlotKey(ph, row.day_idx ?? 0)
+              restoredCtx[slotK] = normalizeCoachContext(row.coach_context)
+            }
+          }
+          if (didRestore) {
+            setSetsByPhase(prev => ({ ...prev, ...restored }))
+            if (Object.keys(restoredCtx).length) setCoachContextBySlot(restoredCtx)
+          }
+        }
+
         let serverTs = 0
         if (todayRes.data?.updated_at) {
           const t = new Date(todayRes.data.updated_at).getTime()
           if (Number.isFinite(t)) serverTs = t
         }
-        const draft = readTodayDraft()
+        // Use readRecentDraft to find drafts across date boundaries (midnight rollover)
+        const draft = readRecentDraft()
         if (draft?.savedAt != null && draft.savedAt > serverTs) {
           if (draft.setsByPhase) setSetsByPhase(migrateTodayLogPayload(draft.setsByPhase))
           if (draft.metconByPhase) setMetconByPhase(migrateTodayLogPayload(draft.metconByPhase))
@@ -795,6 +914,8 @@ export default function App() {
             setCoachContextBySlot(draft.coachContextBySlot)
           }
         }
+
+        cleanOldDraftKeys()
       } catch (e) {
         console.error('Load error:', e)
       }
@@ -829,7 +950,9 @@ export default function App() {
   // ─── Auto-save (debounced → serialized queue: latest state wins, no stale overwrites) ───
   useEffect(() => {
     if (!loaded || !supabase) return
+    if (initialLoadSkipRef.current) { initialLoadSkipRef.current = false; return }
     if (autosaveDebounceRef.current) clearTimeout(autosaveDebounceRef.current)
+    setSaveStatus('saving')
     autosaveDebounceRef.current = setTimeout(() => {
       autosaveDebounceRef.current = null
       persistTailRef.current = persistTailRef.current.catch(() => {}).then(async () => {
@@ -839,13 +962,16 @@ export default function App() {
           const res = await persistTodayToSupabase(supabase, snap, ui)
           if (res.error) {
             pendingSave.current = { snap, ui }
+            setSaveStatus('error')
             console.error('Auto-save error:', res.error)
           } else {
             pendingSave.current = null
+            setSaveStatus('saved')
             scheduleHistoryRefresh()
           }
         } catch (e) {
           pendingSave.current = { snap, ui }
+          setSaveStatus('error')
           console.error('Auto-save error:', e)
         }
       })
@@ -1955,8 +2081,17 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
       <input ref={importRef} type="file" accept="application/json,.json" style={{ display: 'none' }} onChange={handleImportFile} />
       {/* Sticky header + tabs */}
       <div style={S.stickyTop}>
-        {!online && (
-          <div style={S.offlineBanner}>OFFLINE — data will sync when reconnected</div>
+        {saveStatus !== 'saved' && (
+          <div style={{
+            ...S.offlineBanner,
+            background: saveStatus === 'error' ? RED + '30' : saveStatus === 'offline' ? RED + '30' : ACCENT + '30',
+            color: saveStatus === 'error' ? RED : saveStatus === 'offline' ? RED : ACCENT,
+            borderBottomColor: saveStatus === 'error' ? RED + '50' : saveStatus === 'offline' ? RED + '50' : ACCENT + '50'
+          }}>
+            {saveStatus === 'offline' ? 'OFFLINE — will sync when reconnected'
+             : saveStatus === 'error' ? 'SAVE FAILED — retrying...'
+             : 'SAVING...'}
+          </div>
         )}
         {!supabaseReady && (
           <div style={{ background: ACCENT + '30', borderBottom: `1px solid ${ACCENT}50`, padding: '8px 12px', fontSize: 10, color: ACCENT, textAlign: 'center', fontFamily: FONT, fontWeight: 700, letterSpacing: 1, lineHeight: 1.4 }}>

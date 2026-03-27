@@ -1,4 +1,4 @@
-const CACHE_NAME = 'iron-discipline-v2'
+const CACHE_NAME = 'iron-discipline-v3'
 
 const PRECACHE = [
   '/',
