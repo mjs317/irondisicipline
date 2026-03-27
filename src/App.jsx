@@ -18,7 +18,8 @@ import { buildExportPayload, downloadJson, validateImportPayload } from './expor
 const HISTORY_LIMIT = 500
 const LS_PHASE = 'iron_discipline_phase'
 const LS_ACTIVE_DAY = 'iron_discipline_active_day'
-const TODAY_LOG_AUTOSAVE_MS = 1200
+/** Debounce before enqueueing a DB persist (writes are serialized so out-of-order replies cannot clobber newer data). */
+const TODAY_LOG_AUTOSAVE_MS = 450
 function todayDraftStorageKey() {
   return `iron_today_draft_${USER_ID}_${today()}`
 }
@@ -501,6 +502,38 @@ function serializeCoachContextForDb(slotsMap) {
   return { slots, v: 1 }
 }
 
+/** Full day aggregate + current slot session (so history/PRs stay in sync without a manual save). */
+async function persistTodayToSupabase(supabaseClient, snap, ui) {
+  const logRow = {
+    user_id: USER_ID,
+    log_date: today(),
+    sets_data: snap.setsByPhase,
+    metcon_sel: snap.metconByPhase,
+    coach_context: serializeCoachContextForDb(snap.coachContextBySlot),
+    updated_at: new Date().toISOString()
+  }
+  const logRes = await upsertTodayLogCompat(supabaseClient, logRow)
+  if (logRes.error) return logRes
+
+  if (ui?.dayData) {
+    const slotK = coachSlotKey(ui.phase, ui.activeDay)
+    const ctx = normalizeCoachContext(snap.coachContextBySlot[slotK] ?? {})
+    const sessionRow = {
+      user_id: USER_ID,
+      session_date: today(),
+      day_idx: ui.activeDay,
+      day_name: ui.dayData.name,
+      phase: ui.phase,
+      sets_data: snap.setsByPhase[ui.phase] || {},
+      metcon_sel: snap.metconByPhase[ui.phase] || {},
+      coach_context: ctx
+    }
+    const sRes = await upsertWorkoutSessionCompat(supabaseClient, sessionRow)
+    if (sRes.error) return sRes
+  }
+  return { error: null }
+}
+
 // ─── APP ───
 
 export default function App() {
@@ -526,18 +559,20 @@ export default function App() {
   const [planData, setPlanData] = useState(null)
   const [importMsg, setImportMsg] = useState('')
   const importRef = useRef(null)
-  const [saveMsg, setSaveMsg] = useState('')
   const [noteOpen, setNoteOpen] = useState({})
   const [online, setOnline] = useState(navigator.onLine)
   const [pressed, setPressed] = useState(null)
-  const autoSaveTimer = useRef(null)
   const pendingSave = useRef(null)
   const scrollRef = useRef(null)
   const loadedRef = useRef(false)
   /** Latest snapshot for flush / races — updated every render */
   const latestTodayRef = useRef({ setsByPhase, metconByPhase, coachContextBySlot })
-  /** Incremented on each today_log write; stale completions must not clobber newer state. */
-  const todayLogWriteGen = useRef(0)
+  /** Serialize Supabase writes so a slow request cannot overwrite newer autosaves. */
+  const persistTailRef = useRef(Promise.resolve())
+  const autosaveDebounceRef = useRef(null)
+  const historyRefreshTimerRef = useRef(null)
+  /** Phase / day / template for workout_sessions row at persist time */
+  const workoutUiRef = useRef({ phase: 'hypertrophy', activeDay: 0, dayData: null })
 
   latestTodayRef.current = { setsByPhase, metconByPhase, coachContextBySlot }
 
@@ -557,6 +592,7 @@ export default function App() {
 
   const days = PHASES[phase]
   const dayData = days[activeDay]
+  workoutUiRef.current = { phase, activeDay, dayData }
   const sets = setsByPhase[phase] || {}
   const metconSel = metconByPhase[phase] || {}
 
@@ -572,12 +608,12 @@ export default function App() {
   // ─── Retry pending save on reconnect ───
   useEffect(() => {
     if (online && pendingSave.current && supabase) {
-      const data = pendingSave.current
+      const pending = pendingSave.current
       pendingSave.current = null
       ;(async () => {
-        const res = await upsertTodayLogCompat(supabase, data)
-        if (res.error) pendingSave.current = data
-      })().catch(() => { pendingSave.current = data })
+        const res = await persistTodayToSupabase(supabase, pending.snap, pending.ui)
+        if (res.error) pendingSave.current = pending
+      })().catch(() => { pendingSave.current = pending })
     }
   }, [online])
 
@@ -618,30 +654,22 @@ export default function App() {
     if (activeDay > max) setActiveDay(max)
   }, [phase, activeDay])
 
-  // ─── Flush today_log when app backgrounded or closed (mobile PWA) ───
+  // ─── Flush when app backgrounded or closed (mobile PWA) ───
   useEffect(() => {
     if (!supabase) return
     const flush = () => {
       if (!loadedRef.current) return
       writeTodayDraftSync(latestTodayRef.current)
-      if (autoSaveTimer.current) {
-        clearTimeout(autoSaveTimer.current)
-        autoSaveTimer.current = null
+      if (autosaveDebounceRef.current) {
+        clearTimeout(autosaveDebounceRef.current)
+        autosaveDebounceRef.current = null
       }
-      const snap = latestTodayRef.current
-      const payload = {
-        user_id: USER_ID,
-        log_date: today(),
-        sets_data: snap.setsByPhase,
-        metcon_sel: snap.metconByPhase,
-        coach_context: serializeCoachContextForDb(snap.coachContextBySlot),
-        updated_at: new Date().toISOString()
-      }
-      const gen = ++todayLogWriteGen.current
       void (async () => {
-        const res = await upsertTodayLogCompat(supabase, payload)
-        if (gen !== todayLogWriteGen.current) return
-        if (res.error) pendingSave.current = payload
+        await persistTailRef.current.catch(() => {})
+        const snap = latestTodayRef.current
+        const ui = workoutUiRef.current
+        const res = await persistTodayToSupabase(supabase, snap, ui)
+        if (res.error) pendingSave.current = { snap, ui }
         else pendingSave.current = null
       })()
     }
@@ -774,40 +802,58 @@ export default function App() {
     })()
   }, [])
 
-  // ─── Auto-save today log on changes (debounced; stale writes ignored via todayLogWriteGen) ───
+  const scheduleHistoryRefresh = useCallback(() => {
+    if (!supabase) return
+    if (historyRefreshTimerRef.current) clearTimeout(historyRefreshTimerRef.current)
+    historyRefreshTimerRef.current = setTimeout(async () => {
+      historyRefreshTimerRef.current = null
+      try {
+        const histQ = await supabase.from('workout_sessions').select('*').eq('user_id', USER_ID).order('session_date', { ascending: false }).limit(HISTORY_LIMIT)
+        if (histQ.error) {
+          console.error('History refresh:', histQ.error)
+          return
+        }
+        const freshHist = histQ.data || []
+        setHistory(freshHist)
+        if (freshHist.length) {
+          const prMap = recalculatePrsFromSessions(freshHist)
+          setPrs(prMap)
+          await syncPersonalRecordsToDb(supabase, USER_ID, prMap)
+        }
+      } catch (e) {
+        console.error('History refresh:', e)
+      }
+    }, 2000)
+  }, [supabase])
+
+  // ─── Auto-save (debounced → serialized queue: latest state wins, no stale overwrites) ───
   useEffect(() => {
     if (!loaded || !supabase) return
-    if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
-    autoSaveTimer.current = setTimeout(() => {
-      const snap = latestTodayRef.current
-      const payload = {
-        user_id: USER_ID,
-        log_date: today(),
-        sets_data: snap.setsByPhase,
-        metcon_sel: snap.metconByPhase,
-        coach_context: serializeCoachContextForDb(snap.coachContextBySlot),
-        updated_at: new Date().toISOString()
-      }
-      const gen = ++todayLogWriteGen.current
-      void (async () => {
+    if (autosaveDebounceRef.current) clearTimeout(autosaveDebounceRef.current)
+    autosaveDebounceRef.current = setTimeout(() => {
+      autosaveDebounceRef.current = null
+      persistTailRef.current = persistTailRef.current.catch(() => {}).then(async () => {
+        const snap = latestTodayRef.current
+        const ui = workoutUiRef.current
         try {
-          const res = await upsertTodayLogCompat(supabase, payload)
-          if (gen !== todayLogWriteGen.current) return
+          const res = await persistTodayToSupabase(supabase, snap, ui)
           if (res.error) {
-            pendingSave.current = payload
+            pendingSave.current = { snap, ui }
             console.error('Auto-save error:', res.error)
           } else {
             pendingSave.current = null
+            scheduleHistoryRefresh()
           }
         } catch (e) {
-          if (gen !== todayLogWriteGen.current) return
-          pendingSave.current = payload
+          pendingSave.current = { snap, ui }
           console.error('Auto-save error:', e)
         }
-      })()
+      })
     }, TODAY_LOG_AUTOSAVE_MS)
-    return () => { if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current) }
-  }, [setsByPhase, metconByPhase, coachContextBySlot, loaded, supabase])
+    return () => {
+      if (autosaveDebounceRef.current) clearTimeout(autosaveDebounceRef.current)
+    }
+  }, [setsByPhase, metconByPhase, coachContextBySlot, loaded, supabase, phase, activeDay, dayData, scheduleHistoryRefresh])
 
   // ─── Local draft backup — runs sync after commit (narrow window vs hard kill) ───
   useLayoutEffect(() => {
@@ -857,64 +903,6 @@ export default function App() {
       }
     })
   }, [phase])
-
-  // ─── Save workout ───
-  const saveWorkout = async () => {
-    if (!supabase) { setSaveMsg('ERR: DB not configured'); setTimeout(() => setSaveMsg(''), 3000); return }
-    if (!dayData) { setSaveMsg('ERR: No day selected'); setTimeout(() => setSaveMsg(''), 3000); return }
-    setSaveMsg('SAVING...')
-    if (autoSaveTimer.current) {
-      clearTimeout(autoSaveTimer.current)
-      autoSaveTimer.current = null
-    }
-    todayLogWriteGen.current++
-    try {
-      const snap = latestTodayRef.current
-      const slotK = coachSlotKey(phase, activeDay)
-      const ctx = normalizeCoachContext(snap.coachContextBySlot[slotK] ?? {})
-      const sessionRow = {
-        user_id: USER_ID,
-        session_date: today(),
-        day_idx: activeDay,
-        day_name: dayData.name,
-        phase,
-        sets_data: snap.setsByPhase[phase] || {},
-        metcon_sel: snap.metconByPhase[phase] || {},
-        coach_context: ctx
-      }
-      let up = await upsertWorkoutSessionCompat(supabase, sessionRow)
-      if (up.error) throw new Error(up.error.message || 'workout_sessions save failed')
-
-      const logRow = {
-        user_id: USER_ID,
-        log_date: today(),
-        sets_data: snap.setsByPhase,
-        metcon_sel: snap.metconByPhase,
-        coach_context: serializeCoachContextForDb(snap.coachContextBySlot),
-        updated_at: new Date().toISOString()
-      }
-      up = await upsertTodayLogCompat(supabase, logRow)
-      if (up.error) throw new Error(up.error.message || 'today_log save failed')
-
-      const histQ = await supabase.from('workout_sessions').select('*').eq('user_id', USER_ID).order('session_date', { ascending: false }).limit(HISTORY_LIMIT)
-      if (histQ.error) throw new Error(histQ.error.message || 'Failed to reload history')
-
-      const freshHist = histQ.data || []
-      setHistory(freshHist)
-      if (freshHist.length) {
-        const prMap = recalculatePrsFromSessions(freshHist)
-        setPrs(prMap)
-        await syncPersonalRecordsToDb(supabase, USER_ID, prMap)
-      }
-
-      setSaveMsg('✓ SAVED')
-      setTimeout(() => setSaveMsg(''), 2000)
-    } catch (e) {
-      console.error('Save error:', e)
-      setSaveMsg('ERR: ' + e.message)
-      setTimeout(() => setSaveMsg(''), 3000)
-    }
-  }
 
   const buildExerciseLines = (circuits) => {
     const lines = []
@@ -1054,7 +1042,7 @@ Return ONLY valid JSON with: grade (A/B/C/D), summary (one sentence), bullets (s
 
       const prompt = `You are a strength coach. The athlete follows a 4-day lifting program (hypertrophy or strength blocks) while running heavily. Review their last 7 CALENDAR DAYS of saved sessions.
 ${coachContextBlock()}
-Note: "Athlete context" above is how they feel RIGHT NOW in the app (today's form); calendar sessions below include the coach_context saved on each day when they hit save.
+Note: "Athlete context" above is how they feel RIGHT NOW in the app (today's form); calendar sessions below include the coach_context autosaved for each workout day.
 
 App phase toggle (where they are browsing): ${phase}
 
@@ -1521,7 +1509,7 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
       <div style={S.contextCard}>
         <div style={{ marginBottom: 10 }}>
           <div style={{ fontSize: 10, fontWeight: 700, color: ACCENT, letterSpacing: 1, marginBottom: 4 }}>SESSION CONTEXT</div>
-          <div style={{ fontSize: 10, color: MUTED, lineHeight: 1.4 }}>Set before you save — stored per <strong style={{ color: TEXT }}>this program day</strong> (day {activeDay + 1} · {phase}) for AI; other days keep their own.</div>
+          <div style={{ fontSize: 10, color: MUTED, lineHeight: 1.4 }}>Autosaves per <strong style={{ color: TEXT }}>this program day</strong> (day {activeDay + 1} · {phase}) for AI; other days keep their own.</div>
         </div>
 
         <div style={S.contextField}>
@@ -1715,15 +1703,6 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
           </div>
         )
       })}
-
-      <div style={S.btnRow}>
-        <button
-          style={{ ...S.saveBtn(pressed === 'save'), flex: 1 }}
-          onClick={() => { onPress('save'); saveWorkout() }}
-        >
-          {saveMsg || 'SAVE WORKOUT'}
-        </button>
-      </div>
 
       <div style={S.planBox}>
         <div style={{ fontSize: 10, fontWeight: 700, color: BLUE, letterSpacing: 1, marginBottom: 8 }}>AI WEEK PLAN</div>
