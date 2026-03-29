@@ -13,7 +13,7 @@ import {
   upsertWorkoutSessionCompat,
   upsertTodayLogCompat
 } from './trainingUtils'
-import { buildExportPayload, downloadJson, validateImportPayload } from './exportImport'
+import { buildExportPayload, downloadJson, downloadMarkdown, buildMarkdownExport, validateImportPayload } from './exportImport'
 
 const HISTORY_LIMIT = 500
 const LS_PHASE = 'iron_discipline_phase'
@@ -436,6 +436,20 @@ const STRENGTH = [
 ]
 
 const PHASES = { hypertrophy: HYPERTROPHY, strength: STRENGTH }
+
+function buildExerciseNameMap() {
+  const map = {}
+  for (const days of [HYPERTROPHY, STRENGTH]) {
+    for (const day of days) {
+      for (const circuit of day.circuits) {
+        for (const ex of circuit.exercises) {
+          if (!map[ex.id]) map[ex.id] = ex.name
+        }
+      }
+    }
+  }
+  return map
+}
 
 function clampDayIndex(phaseKey, dayIdx) {
   const max = PHASES[phaseKey].length - 1
@@ -1363,6 +1377,22 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
     downloadJson(payload)
   }
 
+  const handleExportForClaude = () => {
+    const exerciseNames = buildExerciseNameMap()
+    const md = buildMarkdownExport({
+      sessions: history,
+      prs,
+      exerciseNames,
+      stats: {
+        totalTonnage: statsBundle.tonnage,
+        weeklyFrequency: statsBundle.perWeek,
+        streak: statsBundle.streak,
+        trends: exerciseTrendFromSessions(history, 8)
+      }
+    })
+    downloadMarkdown(md, `iron-discipline-${today()}.md`)
+  }
+
   const handleImportFile = async (e) => {
     const file = e.target.files?.[0]
     e.target.value = ''
@@ -2078,6 +2108,9 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
     <>
       <div style={{ marginBottom: 16 }}>
         <div style={{ fontSize: 14, fontWeight: 700, letterSpacing: 2 }}>SESSION LOG / HISTORY</div>
+      </div>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
+        <button type="button" style={S.saveBtn(pressed === 'exh')} onClick={() => { onPress('exh'); handleExportForClaude() }}>EXPORT FOR CLAUDE</button>
       </div>
       {history.length === 0 ? (
         <div style={S.emptyText}>No sessions saved yet.</div>
