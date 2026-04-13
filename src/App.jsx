@@ -616,6 +616,17 @@ async function persistTodayToSupabase(supabaseClient, snap, ui) {
   return { error: null }
 }
 
+/** Race a persist against a timeout so a hung mobile request cannot block the autosave queue. */
+function persistTodayWithTimeout(supabaseClient, snap, ui, ms = 15000) {
+  return Promise.race([
+    persistTodayToSupabase(supabaseClient, snap, ui),
+    new Promise((resolve) => setTimeout(
+      () => resolve({ error: { message: `save timeout after ${ms}ms`, code: 'TIMEOUT' } }),
+      ms
+    ))
+  ])
+}
+
 // ─── APP ───
 
 export default function App() {
@@ -654,6 +665,11 @@ export default function App() {
   const persistTailRef = useRef(Promise.resolve())
   const autosaveDebounceRef = useRef(null)
   const historyRefreshTimerRef = useRef(null)
+  /** Retry scheduler: ref-driven so it keeps firing even when saveStatus stays 'error'. */
+  const retryTimerRef = useRef(null)
+  const retryAttemptsRef = useRef(0)
+  /** Forward-ref to scheduleHistoryRefresh (defined later in render). */
+  const scheduleHistoryRefreshRef = useRef(() => {})
   /** Skip the very first autosave trigger after load (prevents writing empty/stale state). */
   const initialLoadSkipRef = useRef(true)
   /** Phase / day / template for workout_sessions row at persist time */
@@ -690,34 +706,69 @@ export default function App() {
     return () => { window.removeEventListener('online', on); window.removeEventListener('offline', off) }
   }, [])
 
+  /** Cancel any pending retry timer. */
+  const cancelRetry = useCallback(() => {
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current)
+      retryTimerRef.current = null
+    }
+  }, [])
+
+  /**
+   * Ref-driven retry scheduler with exponential backoff.
+   * Runs through the serialized persist chain and keeps re-scheduling itself
+   * on failure, independent of React state transitions. Pass `immediate` to
+   * fire on the next tick (e.g. on foreground / online-reconnect).
+   */
+  const scheduleRetry = useCallback((immediate = false) => {
+    if (!supabase || !pendingSave.current) return
+    cancelRetry()
+    const delays = [3000, 6000, 12000, 20000, 30000]
+    const attempt = retryAttemptsRef.current
+    const delay = immediate ? 0 : delays[Math.min(attempt, delays.length - 1)]
+    retryTimerRef.current = setTimeout(() => {
+      retryTimerRef.current = null
+      if (!pendingSave.current || !supabase) return
+      persistTailRef.current = persistTailRef.current.catch(() => {}).then(async () => {
+        if (!pendingSave.current) return
+        // Prefer the newest snapshot — the user may have kept editing while we were stuck.
+        const snap = latestTodayRef.current
+        const ui = workoutUiRef.current
+        try {
+          const res = await persistTodayWithTimeout(supabase, snap, ui)
+          if (res.error) {
+            pendingSave.current = { snap, ui }
+            retryAttemptsRef.current += 1
+            setSaveStatus('error')
+            console.error('Retry save error:', res.error?.message, res.error?.code, res.error?.status, res.error)
+            scheduleRetry()
+          } else {
+            pendingSave.current = null
+            retryAttemptsRef.current = 0
+            setSaveStatus('saved')
+            scheduleHistoryRefreshRef.current?.()
+          }
+        } catch (e) {
+          pendingSave.current = { snap, ui }
+          retryAttemptsRef.current += 1
+          setSaveStatus('error')
+          console.error('Retry save exception:', e)
+          scheduleRetry()
+        }
+      })
+    }, delay)
+  }, [supabase, cancelRetry])
+
   // ─── Retry pending save on reconnect ───
   useEffect(() => {
     if (online && pendingSave.current && supabase) {
-      const pending = pendingSave.current
-      pendingSave.current = null
-      ;(async () => {
-        const res = await persistTodayToSupabase(supabase, pending.snap, pending.ui)
-        if (res.error) { pendingSave.current = pending; setSaveStatus('error') }
-        else setSaveStatus('saved')
-      })().catch(() => { pendingSave.current = pending })
+      retryAttemptsRef.current = 0
+      scheduleRetry(true)
     }
-  }, [online])
+  }, [online, supabase, scheduleRetry])
 
-  // ─── Retry on save error (5s timer, supplements online-reconnect retry) ───
-  useEffect(() => {
-    if (saveStatus !== 'error' || !pendingSave.current || !supabase) return
-    const timer = setTimeout(async () => {
-      const pending = pendingSave.current
-      if (!pending) return
-      pendingSave.current = null
-      try {
-        const res = await persistTodayToSupabase(supabase, pending.snap, pending.ui)
-        if (res.error) { pendingSave.current = pending; setSaveStatus('error') }
-        else setSaveStatus('saved')
-      } catch { pendingSave.current = pending }
-    }, 5000)
-    return () => clearTimeout(timer)
-  }, [saveStatus, supabase])
+  // ─── Clean up any pending retry on unmount ───
+  useEffect(() => cancelRetry, [cancelRetry])
 
   // ─── Dismiss keyboard on scroll ───
   useEffect(() => {
@@ -781,8 +832,8 @@ export default function App() {
         },
         body: JSON.stringify(logRow),
         keepalive: true
-      }).catch(() => {})
-    } catch { /* ignore */ }
+      }).catch((err) => { console.warn('beaconPersist failed:', err) })
+    } catch (err) { console.warn('beaconPersist threw:', err) }
   }, [])
 
   // ─── Flush when app backgrounded or closed (mobile PWA) ───
@@ -800,13 +851,31 @@ export default function App() {
         await persistTailRef.current.catch(() => {})
         const snap = latestTodayRef.current
         const ui = workoutUiRef.current
-        const res = await persistTodayToSupabase(supabase, snap, ui)
-        if (res.error) pendingSave.current = { snap, ui }
-        else pendingSave.current = null
+        try {
+          const res = await persistTodayWithTimeout(supabase, snap, ui)
+          if (res.error) {
+            pendingSave.current = { snap, ui }
+            console.warn('Flush save error:', res.error?.message, res.error?.code)
+          } else {
+            pendingSave.current = null
+          }
+        } catch (e) {
+          pendingSave.current = { snap, ui }
+          console.warn('Flush save exception:', e)
+        }
       })()
     }
     const onVisibility = () => {
-      if (document.visibilityState === 'hidden') flush()
+      if (document.visibilityState === 'hidden') {
+        flush()
+      } else if (document.visibilityState === 'visible') {
+        // App came back to foreground — if a save is still pending and network is up,
+        // retry immediately instead of waiting out the backoff timer.
+        if (pendingSave.current && navigator.onLine) {
+          retryAttemptsRef.current = 0
+          scheduleRetry(true)
+        }
+      }
     }
     const onBeforeUnload = () => {
       writeTodayDraftSync(latestTodayRef.current)
@@ -823,7 +892,7 @@ export default function App() {
       window.removeEventListener('beforeunload', onBeforeUnload)
       document.removeEventListener('freeze', onFreeze)
     }
-  }, [supabase])
+  }, [supabase, scheduleRetry])
 
   // ─── Load data on mount ───
   useEffect(() => {
@@ -1009,6 +1078,9 @@ export default function App() {
     }, 2000)
   }, [supabase])
 
+  // Keep forward-ref in sync so scheduleRetry can refresh history on success.
+  scheduleHistoryRefreshRef.current = scheduleHistoryRefresh
+
   // ─── Auto-save (debounced → serialized queue: latest state wins, no stale overwrites) ───
   useEffect(() => {
     if (!loaded || !supabase) return
@@ -1021,27 +1093,33 @@ export default function App() {
         const snap = latestTodayRef.current
         const ui = workoutUiRef.current
         try {
-          const res = await persistTodayToSupabase(supabase, snap, ui)
+          const res = await persistTodayWithTimeout(supabase, snap, ui)
           if (res.error) {
             pendingSave.current = { snap, ui }
+            retryAttemptsRef.current = 0
             setSaveStatus('error')
-            console.error('Auto-save error:', res.error)
+            console.error('Auto-save error:', res.error?.message, res.error?.code, res.error?.status, res.error)
+            scheduleRetry()
           } else {
             pendingSave.current = null
+            retryAttemptsRef.current = 0
+            cancelRetry()
             setSaveStatus('saved')
             scheduleHistoryRefresh()
           }
         } catch (e) {
           pendingSave.current = { snap, ui }
+          retryAttemptsRef.current = 0
           setSaveStatus('error')
-          console.error('Auto-save error:', e)
+          console.error('Auto-save exception:', e)
+          scheduleRetry()
         }
       })
     }, TODAY_LOG_AUTOSAVE_MS)
     return () => {
       if (autosaveDebounceRef.current) clearTimeout(autosaveDebounceRef.current)
     }
-  }, [setsByPhase, metconByPhase, coachContextBySlot, loaded, supabase, phase, activeDay, dayData, scheduleHistoryRefresh])
+  }, [setsByPhase, metconByPhase, coachContextBySlot, loaded, supabase, phase, activeDay, dayData, scheduleHistoryRefresh, scheduleRetry, cancelRetry])
 
   // ─── Local draft backup — runs sync after commit (narrow window vs hard kill) ───
   useLayoutEffect(() => {
