@@ -14,6 +14,9 @@ import {
   upsertTodayLogCompat
 } from './trainingUtils'
 import { buildExportPayload, downloadJson, downloadMarkdown, buildMarkdownExport, validateImportPayload } from './exportImport'
+import { DEMO_SESSIONS, DEMO_TODAY_SETS, DEMO_PRS } from './demoData'
+
+const DEMO_MODE = new URLSearchParams(window.location.search).get('demo') === 'true'
 
 const HISTORY_LIMIT = 500
 const LS_PHASE = 'iron_discipline_phase'
@@ -692,7 +695,7 @@ export default function App() {
 
   // ─── Retry pending save on reconnect ───
   useEffect(() => {
-    if (online && pendingSave.current && supabase) {
+    if (online && pendingSave.current && supabase && !DEMO_MODE) {
       const pending = pendingSave.current
       pendingSave.current = null
       ;(async () => {
@@ -705,7 +708,7 @@ export default function App() {
 
   // ─── Retry on save error (5s timer, supplements online-reconnect retry) ───
   useEffect(() => {
-    if (saveStatus !== 'error' || !pendingSave.current || !supabase) return
+    if (saveStatus !== 'error' || !pendingSave.current || !supabase || DEMO_MODE) return
     const timer = setTimeout(async () => {
       const pending = pendingSave.current
       if (!pending) return
@@ -744,7 +747,7 @@ export default function App() {
   }, [loaded])
 
   useEffect(() => {
-    if (!loaded) return
+    if (!loaded || DEMO_MODE) return
     try {
       localStorage.setItem(LS_PHASE, phase)
       localStorage.setItem(LS_ACTIVE_DAY, String(activeDay))
@@ -758,7 +761,7 @@ export default function App() {
 
   // ─── Keepalive persist: survives page destruction on mobile ───
   const beaconPersist = useCallback((snap) => {
-    if (!supabaseReady || !snap) return
+    if (!supabaseReady || !snap || DEMO_MODE) return
     const url = import.meta.env.VITE_SUPABASE_URL
     const key = import.meta.env.VITE_SUPABASE_ANON_KEY
     if (!url || !key) return
@@ -787,7 +790,7 @@ export default function App() {
 
   // ─── Flush when app backgrounded or closed (mobile PWA) ───
   useEffect(() => {
-    if (!supabase) return
+    if (!supabase || DEMO_MODE) return
     const flush = () => {
       if (!loadedRef.current) return
       writeTodayDraftSync(latestTodayRef.current)
@@ -827,6 +830,15 @@ export default function App() {
 
   // ─── Load data on mount ───
   useEffect(() => {
+    if (DEMO_MODE) {
+      setHistory(DEMO_SESSIONS)
+      setPrs(DEMO_PRS)
+      setPhase('hypertrophy')
+      setActiveDay(0)
+      setSetsByPhase(DEMO_TODAY_SETS)
+      setLoaded(true)
+      return
+    }
     if (!supabase) { setLoaded(true); return }
     ;(async () => {
       try {
@@ -986,7 +998,7 @@ export default function App() {
   }, [])
 
   const scheduleHistoryRefresh = useCallback(() => {
-    if (!supabase) return
+    if (!supabase || DEMO_MODE) return
     if (historyRefreshTimerRef.current) clearTimeout(historyRefreshTimerRef.current)
     historyRefreshTimerRef.current = setTimeout(async () => {
       historyRefreshTimerRef.current = null
@@ -1011,7 +1023,7 @@ export default function App() {
 
   // ─── Auto-save (debounced → serialized queue: latest state wins, no stale overwrites) ───
   useEffect(() => {
-    if (!loaded || !supabase) return
+    if (!loaded || !supabase || DEMO_MODE) return
     if (initialLoadSkipRef.current) { initialLoadSkipRef.current = false; return }
     if (autosaveDebounceRef.current) clearTimeout(autosaveDebounceRef.current)
     setSaveStatus('saving')
@@ -1045,7 +1057,7 @@ export default function App() {
 
   // ─── Local draft backup — runs sync after commit (narrow window vs hard kill) ───
   useLayoutEffect(() => {
-    if (!loaded) return
+    if (!loaded || DEMO_MODE) return
     writeTodayDraftSync(latestTodayRef.current)
   }, [setsByPhase, metconByPhase, coachContextBySlot, loaded])
 
@@ -1394,6 +1406,7 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
   }
 
   const handleImportFile = async (e) => {
+    if (DEMO_MODE) return
     const file = e.target.files?.[0]
     e.target.value = ''
     if (!file) return
@@ -2058,7 +2071,7 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
         )}
         <div style={{ display: 'flex', gap: 8, marginTop: 16, flexWrap: 'wrap' }}>
           <button type="button" style={S.saveBtn(pressed === 'exs')} onClick={() => { onPress('exs'); handleExport() }}>EXPORT JSON</button>
-          <button type="button" style={S.coachBtn(false, pressed === 'ims')} onClick={() => { onPress('ims'); importRef.current?.click() }}>IMPORT JSON</button>
+          {!DEMO_MODE && <button type="button" style={S.coachBtn(false, pressed === 'ims')} onClick={() => { onPress('ims'); importRef.current?.click() }}>IMPORT JSON</button>}
         </div>
         {importMsg && <div style={{ fontSize: 10, color: ACCENT, marginTop: 8 }}>{importMsg}</div>}
       </>
@@ -2074,7 +2087,7 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
       <>
         <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
           <button type="button" style={S.saveBtn(pressed === 'exp')} onClick={() => { onPress('exp'); handleExport() }}>EXPORT JSON</button>
-          <button type="button" style={S.coachBtn(false, pressed === 'imp')} onClick={() => { onPress('imp'); importRef.current?.click() }}>IMPORT JSON</button>
+          {!DEMO_MODE && <button type="button" style={S.coachBtn(false, pressed === 'imp')} onClick={() => { onPress('imp'); importRef.current?.click() }}>IMPORT JSON</button>}
         </div>
         {importMsg && <div style={{ fontSize: 10, color: ACCENT, marginBottom: 8 }}>{importMsg}</div>}
         <div style={{ marginBottom: 16 }}>
@@ -2174,7 +2187,12 @@ Return ONLY valid JSON: grade (A-D) for the WEEK, summary (one sentence on the w
              : 'SAVING...'}
           </div>
         )}
-        {!supabaseReady && (
+        {DEMO_MODE && (
+          <div style={{ background: BLUE + '20', borderBottom: `1px solid ${BLUE}50`, padding: '8px 12px', fontSize: 10, color: BLUE, textAlign: 'center', fontFamily: FONT, fontWeight: 700, letterSpacing: 1, lineHeight: 1.4 }}>
+            DEMO MODE — read only · explore freely, no data is saved
+          </div>
+        )}
+        {!supabaseReady && !DEMO_MODE && (
           <div style={{ background: ACCENT + '30', borderBottom: `1px solid ${ACCENT}50`, padding: '8px 12px', fontSize: 10, color: ACCENT, textAlign: 'center', fontFamily: FONT, fontWeight: 700, letterSpacing: 1, lineHeight: 1.4 }}>
             DB NOT CONNECTED — set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in Vercel env vars, then redeploy
           </div>
