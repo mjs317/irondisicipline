@@ -16,7 +16,10 @@ import {
 import { buildExportPayload, downloadJson, downloadMarkdown, buildMarkdownExport, validateImportPayload } from './exportImport'
 import { DEMO_SESSIONS, DEMO_TODAY_SETS, DEMO_PRS } from './demoData'
 
-const DEMO_MODE = new URLSearchParams(window.location.search).get('demo') === 'true'
+// Activate via ?demo=true; persists in sessionStorage for the whole browser session.
+const _demoParam = new URLSearchParams(window.location.search).get('demo') === 'true'
+if (_demoParam) sessionStorage.setItem('ironDemoMode', 'true')
+const DEMO_MODE = _demoParam || sessionStorage.getItem('ironDemoMode') === 'true'
 
 const HISTORY_LIMIT = 500
 const LS_PHASE = 'iron_discipline_phase'
